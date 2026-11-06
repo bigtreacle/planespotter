@@ -1,0 +1,83 @@
+# Cutting a release:
+#   git tag -a v1.1.0 -m "Fix route lookup for codeshare callsigns"
+#   git push --tags
+# A tag with a hyphen (v1.1.0-rc1) becomes a pre-release, which devices ignore
+# because they only look at the "latest" release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            ~/.platformio/.cache
+          key: platformio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - run: pip install platformio
+
+      - name: Version from tag
+        id: ver
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Tag message becomes the release notes; a lightweight tag has none.
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          NOTES="$(git tag -l --format='%(contents)' "$TAG" | sed '/^-----BEGIN PGP SIGNATURE-----/,$d')"
+          [ -n "$NOTES" ] || NOTES="Release $TAG"
+          {
+            echo "notes<<EOF_NOTES"
+            echo "$NOTES"
+            echo "EOF_NOTES"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build both variants
+        env:
+          PLATFORMIO_BUILD_FLAGS: -DFIRMWARE_VERSION=\"${{ steps.ver.outputs.version }}\"
+        run: |
+          pio run -e cyd -e cyd2usb
+          mkdir -p dist
+          cp .pio/build/cyd/firmware.bin dist/planespotter-cyd.bin
+          cp .pio/build/cyd2usb/firmware.bin dist/planespotter-cyd2usb.bin
+
+      - name: Write manifest
+        run: |
+          python3 -I scripts/make_manifest.py \
+            "${{ steps.ver.outputs.version }}" "${{ steps.ver.outputs.tag }}" dist \
+            "$(printf '%s' "${{ steps.ver.outputs.notes }}" | head -n 1)"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ steps.ver.outputs.notes }}
+        run: |
+          EXTRA=()
+          [ "${{ steps.ver.outputs.prerelease }}" = "true" ] && EXTRA+=(--prerelease)
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            --title "${{ steps.ver.outputs.tag }}" \
+            --notes "$NOTES" \
+            --verify-tag "${EXTRA[@]}" \
+            dist/planespotter-cyd.bin dist/planespotter-cyd2usb.bin dist/manifest.json

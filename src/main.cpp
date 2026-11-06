@@ -5,7 +5,9 @@
 //
 // Setup: on first boot the board opens a WiFi hotspot called "PlaneSpotter".
 // Join it, pick the home WiFi, enter a UK postcode (or lat/lon). To change
-// settings later, hold the BOOT button on the back for 3 seconds.
+// settings later, hold the BOOT button on the back for 3 seconds. A short
+// press checks for a firmware update (see ota.h); updates also happen
+// automatically 20 s after WiFi connects and then once a day.
 //
 // Data: adsb.lol (fallback adsb.fi) for positions, adsbdb.com for routes,
 // postcodes.io for postcode lookup. All free, no API keys.
@@ -19,11 +21,16 @@
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 
+#include "ota.h"
+
 // ---------- constants ----------
 static const char *AP_NAME = "PlaneSpotter";
 static const int BOOT_BTN = 0;
 static const int BACKLIGHT_PIN = 21;
 static const uint32_t POLL_MS = 30000;
+static const uint32_t OTA_BOOT_DELAY_MS = 20000;            // after WiFi is up
+static const uint32_t OTA_PERIOD_MS = 24UL * 60 * 60 * 1000; // then daily
+static const uint32_t OTA_VALID_AFTER_MS = 60000;           // uptime that counts as "works"
 static const int W = 320, H = 240;
 static const int STATS_Y = 168;  // top of the bottom stats band
 
@@ -114,6 +121,11 @@ Plane shown;
 Route route;
 uint32_t lastPoll = 0;
 bool lastFetchOk = true;
+bool everFetchedOk = false;
+uint32_t wifiUpAt = 0;
+bool otaBootCheckDone = false;
+uint32_t lastOtaCheck = 0;
+bool otaScreenShown = false; // an update attempt drew over the aircraft display
 
 WiFiManagerParameter *pPostcode, *pLat, *pLon, *pRadius, *pBright;
 
@@ -330,6 +342,25 @@ static void drawMessage(const char *title, const char *line1, const char *line2 
   tft.drawString(line1, W / 2, 115, 2);
   tft.drawString(line2, W / 2, 140, 2);
   tft.drawString(line3, W / 2, 165, 2);
+  // running firmware version, so a unit can be identified without a cable
+  tft.setTextDatum(BR_DATUM);
+  tft.setTextColor(DIM, TFT_BLACK);
+  tft.drawString(ota::versionLabel(), W - 6, H - 4, 2);
+  tft.setTextDatum(MC_DATUM);
+}
+
+// Download progress bar for the update screen; redraws only when the percent changes.
+static void drawProgress(int done, int total) {
+  static int lastPct = -1;
+  int pct = total > 0 ? (int)((int64_t)done * 100 / total) : 0;
+  if (pct == lastPct) return;
+  lastPct = pct;
+  const int x = 40, y = 150, w = W - 80, h = 14;
+  tft.drawRect(x, y, w, h, GREY);
+  tft.fillRect(x + 2, y + 2, (w - 4) * pct / 100, h - 4, TFT_WHITE);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(GREY, TFT_BLACK);
+  tft.drawString(String(pct) + "%  ", W / 2, y + 32, 2);
 }
 
 // Draws text centred, dropping to the small font if it would overflow.
@@ -431,10 +462,55 @@ static void applyPortalParams() {
 }
 
 static void runPortal(bool onDemand) {
+  ota::markValid(); // a unit waiting for new WiFi details must not roll back on power cycle
   wm.setConfigPortalTimeout(onDemand ? 300 : 0);
   bool ok = onDemand ? wm.startConfigPortal(AP_NAME) : wm.autoConnect(AP_NAME);
   applyPortalParams();
   if (onDemand || !ok) ESP.restart();
+}
+
+// ---------- firmware updates ----------
+static void runOtaCheck(bool manual) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  otaScreenShown = manual;
+  if (manual) drawMessage("PlaneSpotter", "Checking for updates...");
+
+  ota::Ui ui;
+  ui.message = [](const char *title, const String &line) {
+    otaScreenShown = true;
+    drawMessage(title, line.c_str());
+  };
+  ui.progress = drawProgress;
+
+  String newVersion;
+  ota::Result r = ota::check(manual, ui, newVersion);
+  switch (r) {
+    case ota::UPDATED:
+      drawMessage("Update complete", ("Restarting as version " + newVersion).c_str());
+      delay(2000);
+      ESP.restart();
+      break;
+    case ota::FAILED:
+      if (otaScreenShown) {
+        drawMessage("Update failed", ("Still running " + ota::versionLabel()).c_str(),
+                    "Will try again later");
+        delay(3000);
+      }
+      break;
+    case ota::NO_RELEASE:
+    case ota::UP_TO_DATE:
+      if (manual) {
+        drawMessage("Up to date", ota::versionLabel().c_str());
+        delay(3000);
+      }
+      break;
+  }
+  if (otaScreenShown) {
+    // put the aircraft display back: forget what is shown and poll straight away
+    shown = Plane();
+    lastPoll = millis() - POLL_MS;
+    otaScreenShown = false;
+  }
 }
 
 // ---------- main ----------
@@ -466,6 +542,7 @@ void setup() {
   wm.setTitle("PlaneSpotter setup");
 
   runPortal(false);
+  wifiUpAt = millis();
   setBacklight(cfg.brightness);
 
   if (cfg.postcode.length() && cfg.postcode != cfg.pcResolved) {
@@ -481,11 +558,29 @@ void setup() {
 }
 
 void loop() {
-  // Hold BOOT for 3 seconds to reopen the setup portal
+  // BOOT button: hold 3 seconds to reopen the setup portal, short press to
+  // check for a firmware update now.
   if (digitalRead(BOOT_BTN) == LOW) {
     uint32_t t0 = millis();
     while (digitalRead(BOOT_BTN) == LOW && millis() - t0 < 3000) delay(20);
-    if (millis() - t0 >= 3000) runPortal(true);
+    uint32_t held = millis() - t0;
+    if (held >= 3000) runPortal(true);
+    else if (held >= 50 && held < 1000) runOtaCheck(true);
+  }
+
+  // A freshly updated image is only pending until it has shown it works: one
+  // successful fetch, or a minute of running. Then rollback is cancelled.
+  if (everFetchedOk || millis() > OTA_VALID_AFTER_MS) ota::markValid();
+
+  // Automatic update checks: once shortly after WiFi came up, then daily.
+  if (WiFi.status() == WL_CONNECTED) {
+    bool due = !otaBootCheckDone ? (millis() - wifiUpAt > OTA_BOOT_DELAY_MS)
+                                 : (millis() - lastOtaCheck > OTA_PERIOD_MS);
+    if (due) {
+      otaBootCheckDone = true;
+      lastOtaCheck = millis();
+      runOtaCheck(false);
+    }
   }
 
   if (millis() - lastPoll < POLL_MS) {
@@ -503,6 +598,7 @@ void loop() {
 
   Plane p;
   lastFetchOk = fetchNearest(p);
+  if (lastFetchOk) everFetchedOk = true;
   if (!lastFetchOk) {
     drawStatusDot(); // keep showing the last aircraft, flag the problem
     return;
