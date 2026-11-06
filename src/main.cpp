@@ -22,6 +22,8 @@
 #include <TFT_eSPI.h>
 
 #include "ota.h"
+#include "model.h"
+#include "renderer.h"
 
 // ---------- constants ----------
 static const char *AP_NAME = "PlaneSpotter";
@@ -31,15 +33,8 @@ static const uint32_t POLL_MS = 30000;
 static const uint32_t OTA_BOOT_DELAY_MS = 20000;            // after WiFi is up
 static const uint32_t OTA_PERIOD_MS = 24UL * 60 * 60 * 1000; // then daily
 static const uint32_t OTA_VALID_AFTER_MS = 60000;           // uptime that counts as "works"
-static const int W = 320, H = 240;
-static const int STATS_Y = 168;  // top of the bottom stats band
 
 // ---------- airline brand colours (by ICAO callsign prefix) ----------
-struct Airline {
-  const char *icao;
-  const char *name;
-  uint8_t r, g, b;
-};
 static const Airline AIRLINES[] = {
     {"BAW", "British Airways", 60, 120, 230},
     {"SHT", "British Airways", 60, 120, 230},
@@ -95,25 +90,11 @@ struct Config {
   float lon = -0.1278;
   int radiusNm = 15;
   int brightness = 80; // percent
-};
-
-struct Plane {
-  bool valid = false;
-  String hex, callsign, reg, type;
-  long altFt = 0;
-  int speedKt = 0;
-  int vrate = 0; // ft/min
-  float distMi = 0;
-  float bearing = 0; // degrees from home to aircraft
-};
-
-struct Route {
-  String forCallsign;
-  bool known = false;
-  String airline, oIata, oCity, dIata, dCity;
+  int style = STYLE_CRISP; // see renderer.h
 };
 
 TFT_eSPI tft;
+Renderer *renderer = nullptr;
 Preferences prefs;
 WiFiManager wm;
 Config cfg;
@@ -127,13 +108,9 @@ bool otaBootCheckDone = false;
 uint32_t lastOtaCheck = 0;
 bool otaScreenShown = false; // an update attempt drew over the aircraft display
 
-WiFiManagerParameter *pPostcode, *pLat, *pLon, *pRadius, *pBright;
+WiFiManagerParameter *pPostcode, *pLat, *pLon, *pRadius, *pBright, *pStyle;
 
 // ---------- helpers ----------
-static uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) { return tft.color565(r, g, b); }
-#define GREY rgb(150, 150, 150)
-#define DIM rgb(70, 70, 70)
-
 static void setBacklight(int percent) {
   percent = constrain(percent, 5, 100);
   analogWrite(BACKLIGHT_PIN, map(percent, 0, 100, 0, 255));
@@ -147,12 +124,6 @@ static String ascii(const String &s) {
     if (c >= 32 && c < 127) out += c;
   }
   return out;
-}
-
-static String thousands(long n) {
-  String s = String(labs(n));
-  for (int i = s.length() - 3; i > 0; i -= 3) s = s.substring(0, i) + "," + s.substring(i);
-  return n < 0 ? "-" + s : s;
 }
 
 static float haversineMi(float lat1, float lon1, float lat2, float lon2) {
@@ -170,11 +141,6 @@ static float bearingDeg(float lat1, float lon1, float lat2, float lon2) {
             sinf(radians(lat1)) * cosf(radians(lat2)) * cosf(dLon);
   float b = degrees(atan2f(y, x));
   return b < 0 ? b + 360 : b;
-}
-
-static const char *compass(float deg) {
-  static const char *pts[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
-  return pts[((int)((deg + 22.5f) / 45.0f)) % 8];
 }
 
 static const Airline *findAirline(const String &callsign) {
@@ -201,6 +167,7 @@ static void loadConfig() {
   cfg.lon = prefs.getFloat("lon", cfg.lon);
   cfg.radiusNm = prefs.getInt("rad", cfg.radiusNm);
   cfg.brightness = prefs.getInt("bri", cfg.brightness);
+  cfg.style = prefs.getInt("style", cfg.style);
   prefs.end();
 }
 
@@ -212,6 +179,7 @@ static void saveConfig() {
   prefs.putFloat("lon", cfg.lon);
   prefs.putInt("rad", cfg.radiusNm);
   prefs.putInt("bri", cfg.brightness);
+  prefs.putInt("style", cfg.style);
   prefs.end();
 }
 
@@ -332,112 +300,34 @@ static void fetchRoute(const String &callsign) {
 }
 
 // ---------- drawing ----------
+// Thin wrappers over the active Renderer (see renderer.h).
 static void drawMessage(const char *title, const char *line1, const char *line2 = "",
                         const char *line3 = "") {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(title, W / 2, 60, 4);
-  tft.setTextColor(GREY, TFT_BLACK);
-  tft.drawString(line1, W / 2, 115, 2);
-  tft.drawString(line2, W / 2, 140, 2);
-  tft.drawString(line3, W / 2, 165, 2);
-  // running firmware version, so a unit can be identified without a cable
-  tft.setTextDatum(BR_DATUM);
-  tft.setTextColor(DIM, TFT_BLACK);
-  tft.drawString(ota::versionLabel(), W - 6, H - 4, 2);
-  tft.setTextDatum(MC_DATUM);
+  renderer->drawMessage(title, line1, line2, line3);
 }
 
-// Download progress bar for the update screen; redraws only when the percent changes.
-static void drawProgress(int done, int total) {
-  static int lastPct = -1;
-  int pct = total > 0 ? (int)((int64_t)done * 100 / total) : 0;
-  if (pct == lastPct) return;
-  lastPct = pct;
-  const int x = 40, y = 150, w = W - 80, h = 14;
-  tft.drawRect(x, y, w, h, GREY);
-  tft.fillRect(x + 2, y + 2, (w - 4) * pct / 100, h - 4, TFT_WHITE);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(GREY, TFT_BLACK);
-  tft.drawString(String(pct) + "%  ", W / 2, y + 32, 2);
-}
+static void drawProgress(int done, int total) { renderer->drawProgress(done, total); }
 
-// Draws text centred, dropping to the small font if it would overflow.
-static void drawFit(const String &s, int x, int y, int maxW) {
-  tft.drawString(s, x, y, tft.textWidth(s, 4) <= maxW ? 4 : 2);
-}
+static void drawStatusDot() { renderer->drawStatusDot(lastFetchOk); }
 
-static void drawStats(const Plane &p) {
-  tft.fillRect(0, STATS_Y, W, H - STATS_Y, TFT_BLACK);
-  tft.drawFastHLine(10, STATS_Y, W - 20, DIM);
-  tft.setTextDatum(MC_DATUM);
-
-  const int cols[] = {55, 160, 265};
-  const char *labels[] = {"ALTITUDE", "SPEED", "DISTANCE"};
-  tft.setTextColor(GREY, TFT_BLACK);
-  for (int i = 0; i < 3; i++) tft.drawString(labels[i], cols[i], STATS_Y + 16, 2);
-
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  String alt = thousands(p.altFt);
-  tft.drawString(alt, cols[0], STATS_Y + 42, 4);
-  // climb / descent marker next to the altitude
-  int ax = cols[0] + tft.textWidth(alt, 4) / 2 + 9, ay = STATS_Y + 40;
-  if (p.vrate > 300) tft.fillTriangle(ax - 5, ay + 5, ax + 5, ay + 5, ax, ay - 6, TFT_GREEN);
-  if (p.vrate < -300) tft.fillTriangle(ax - 5, ay - 5, ax + 5, ay - 5, ax, ay + 6, TFT_ORANGE);
-
-  tft.drawString(String(p.speedKt), cols[1], STATS_Y + 42, 4);
-  tft.drawString(String(p.distMi, 1), cols[2], STATS_Y + 42, 4);
-
-  tft.setTextColor(GREY, TFT_BLACK);
-  tft.drawString("feet", cols[0], STATS_Y + 63, 2);
-  tft.drawString("knots", cols[1], STATS_Y + 63, 2);
-  tft.drawString(String("miles ") + compass(p.bearing), cols[2], STATS_Y + 63, 2);
-}
-
+// Full redraw for a new aircraft, timed so the styles can be compared on serial.
 static void drawPlane(const Plane &p) {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-
-  // Headline: airline in brand colour (or callsign/registration for others)
-  const Airline *al = findAirline(p.callsign);
-  String headline = al ? String(al->name)
-                       : route.airline.length() ? route.airline
-                       : p.callsign.length() ? p.callsign
-                       : p.reg.length() ? p.reg
-                                        : String("Unknown aircraft");
-  tft.setTextColor(al ? rgb(al->r, al->g, al->b) : TFT_WHITE, TFT_BLACK);
-  drawFit(headline, W / 2, 22, W - 16);
-
-  // Sub-line: callsign, type, registration
-  String sub = p.callsign;
-  if (p.type.length()) sub += (sub.length() ? "   " : "") + p.type;
-  if (p.reg.length() && p.reg != p.callsign) sub += (sub.length() ? "   " : "") + p.reg;
-  tft.setTextColor(GREY, TFT_BLACK);
-  tft.drawString(sub, W / 2, 50, 2);
-
-  // Route
-  if (route.known) {
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setTextSize(2);
-    tft.drawString(route.oIata, 78, 98, 4);
-    tft.drawString(route.dIata, 242, 98, 4);
-    tft.setTextSize(1);
-    tft.fillRect(142, 96, 26, 4, GREY);
-    tft.fillTriangle(168, 88, 168, 108, 182, 98, GREY);
-    tft.setTextColor(GREY, TFT_BLACK);
-    tft.drawString(route.oCity.substring(0, 18), 78, 140, 2);
-    tft.drawString(route.dCity.substring(0, 18), 242, 140, 2);
-  } else {
-    tft.setTextColor(DIM, TFT_BLACK);
-    tft.drawString("Route not available", W / 2, 110, 4);
-  }
-
-  drawStats(p);
+  uint32_t t0 = millis();
+  renderer->drawPlane(p, route, findAirline(p.callsign));
+  Serial.printf("style %d: full redraw of %s took %lu ms\n", cfg.style, p.callsign.c_str(),
+                (unsigned long)(millis() - t0));
 }
 
-static void drawStatusDot() {
-  tft.fillCircle(W - 7, 7, 3, lastFetchOk ? TFT_BLACK : TFT_RED);
+static void drawStats(const Plane &p) { renderer->drawStats(p); }
+
+// Switches display style; takes effect on the next redraw.
+static void setStyle(int style) {
+  if (renderer && style == cfg.style) return;
+  cfg.style = style;
+  delete renderer;
+  renderer = makeRenderer(style, tft);
+  renderer->setBrightness(cfg.brightness);
+  shown = Plane(); // force a redraw on the next poll
 }
 
 // ---------- setup portal ----------
@@ -461,7 +351,9 @@ static void applyPortalParams() {
   }
   cfg.radiusNm = constrain(String(pRadius->getValue()).toInt(), 2, 50);
   cfg.brightness = constrain(String(pBright->getValue()).toInt(), 5, 100);
+  cfg.style = constrain((int)String(pStyle->getValue()).toInt(), (int)STYLE_CRISP, (int)STYLE_MATRIX_80);
   saveConfig();
+  setStyle(cfg.style);
 }
 
 static void runPortal(bool onDemand) {
@@ -525,6 +417,7 @@ void setup() {
   loadConfig();
   ota::begin();
   setBacklight(cfg.brightness);
+  setStyle(cfg.style);
   drawMessage("PlaneSpotter", "Connecting to WiFi...");
 
   pPostcode = new WiFiManagerParameter("pc", "UK postcode", cfg.postcode.c_str(), 10);
@@ -536,17 +429,22 @@ void setup() {
                                      String(cfg.radiusNm).c_str(), 4);
   pBright = new WiFiManagerParameter("bri", "Brightness (5-100)",
                                      String(cfg.brightness).c_str(), 4);
+  pStyle = new WiFiManagerParameter(
+      "style", "Display style: 0 = crisp, 1 = LED matrix 64x48, 2 = LED matrix 80x60",
+      String(cfg.style).c_str(), 2, "type='number' min='0' max='2'");
   wm.addParameter(pPostcode);
   wm.addParameter(pLat);
   wm.addParameter(pLon);
   wm.addParameter(pRadius);
   wm.addParameter(pBright);
+  wm.addParameter(pStyle);
   wm.setAPCallback(onPortalStart);
   wm.setTitle("PlaneSpotter setup");
 
   runPortal(false);
   wifiUpAt = millis();
   setBacklight(cfg.brightness);
+  renderer->setBrightness(cfg.brightness);
 
   if (cfg.postcode.length() && cfg.postcode != cfg.pcResolved) {
     drawMessage("PlaneSpotter", "Looking up postcode...");
@@ -560,7 +458,32 @@ void setup() {
   lastPoll = millis() - POLL_MS; // poll straight away
 }
 
+// Serial commands for a bench unit: "style N" switches display style without
+// the portal (saved like a portal change); "dump" prints the screen as text.
+static void handleSerial() {
+  static String line;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c != '\n' && c != '\r') {
+      if (line.length() < 32) line += c;
+      continue;
+    }
+    if (line.startsWith("style ")) {
+      int style = constrain((int)line.substring(6).toInt(), (int)STYLE_CRISP, (int)STYLE_MATRIX_80);
+      setStyle(style);
+      saveConfig();
+      lastPoll = millis() - POLL_MS; // redraw straight away
+      Serial.printf("style set to %d\n", style);
+    } else if (line == "dump") {
+      renderer->dump();
+    }
+    line = "";
+  }
+}
+
 void loop() {
+  handleSerial();
+
   // BOOT button: hold 3 seconds to reopen the setup portal, short press to
   // check for a firmware update now.
   if (digitalRead(BOOT_BTN) == LOW) {
@@ -587,6 +510,7 @@ void loop() {
   }
 
   if (millis() - lastPoll < POLL_MS) {
+    renderer->tick(); // matrix-style scrolling; returns at once when idle
     delay(50);
     return;
   }

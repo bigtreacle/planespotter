@@ -39,6 +39,20 @@ To change WiFi or location later, hold the BOOT button on the back for
 3 seconds. Outside the UK, leave the postcode blank and enter latitude
 and longitude.
 
+## Display style
+
+The setup portal has a "Display style" field: `0` is the default crisp
+layout, `1` and `2` imitate an LED dot-matrix sign at 64x48 dots (5 px
+pitch) or 80x60 dots (4 px pitch). In the matrix styles the airline name
+scrolls when it is too long for the row, the route is `RAK>LHR`, and the
+bottom row packs altitude (with a climb/descent arrow), speed, distance and
+direction into whatever detail fits. The choice is stored on the unit; the
+screen is black and redraws when the style changes.
+
+On a bench unit the style can also be switched over serial without the
+portal: type `style 1` (or `0`, `2`) in the serial monitor. `dump` prints
+the matrix grid as text, which is handy when tweaking the layout.
+
 ## Updates
 
 Units check for a new firmware release 20 seconds after connecting to WiFi
@@ -90,6 +104,9 @@ normally; it just stops updating until reflashed over USB.
 - Routes come from adsbdb.com, matched on callsign. They are sometimes
   missing or out of date.
 - Add airlines or change colours in the `AIRLINES` table in `src/main.cpp`.
+- Drawing lives behind the `Renderer` interface in `src/renderer.h`:
+  `src/crisp_renderer.cpp` is the original layout, `src/matrix_renderer.cpp`
+  the dot-matrix look.
 - OTA code lives in `src/ota.cpp`; the release pipeline in
   `.github/workflows/release.yml` and `scripts/make_manifest.py`.
 - Data: adsb.lol (fallback adsb.fi), adsbdb.com, postcodes.io.
