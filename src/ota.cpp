@@ -12,6 +12,12 @@ static const char *REPO_URL = "https://github.com/bigtreacle/planespotter/";
 static const char *MANIFEST_URL =
     "https://github.com/bigtreacle/planespotter/releases/latest/download/manifest.json";
 
+// The Arduino core marks a freshly installed OTA image valid during startup,
+// before setup() runs, unless this hook asks it to defer. Deferring is what
+// makes rollback real: markValid() below is then the only thing that cancels
+// it, and a build that crashes before it gets there reverts on the next boot.
+extern "C" bool verifyRollbackLater() { return true; }
+
 namespace ota {
 
 const char *version() { return FIRMWARE_VERSION; }
