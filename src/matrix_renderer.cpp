@@ -37,6 +37,41 @@ const uint8_t MASK4[16] = {
 
 const uint32_t SCROLL_STEP_MS = 125;  // ~8 columns per second
 const uint32_t SCROLL_PAUSE_MS = 2000;
+const int MAX_SCROLL = 8;             // rows that may scroll at once (a message screen has at most 6)
+
+// A row of text that is wider than the grid and sweeps back and forth.
+struct Scroller {
+  String text;
+  uint16_t color;
+  int y, w, x, dir;
+  uint32_t next;
+};
+
+// Shorter wording for the status messages main.cpp uses, which were written
+// for the crisp layout. Applied as substring replacements, in this order.
+const char *const CONDENSE[][2] = {
+    {"On your phone, join the WiFi network", "Join WiFi"},
+    {"\"PlaneSpotter\"", "PlaneSpotter"},
+    {"then follow the page that opens", "on phone"},
+    {"Connecting to WiFi...", "Connecting WiFi"},
+    {"Looking up postcode...", "Finding postcode"},
+    {"Scanning the sky...", "Scanning sky"},
+    {"Checking for updates...", "Checking updates"},
+    {"Update complete", "Updated"},
+    {"Restarting as version ", "Restarting v"},
+    {"Still running ", "Running "},
+    {"Will try again later", "Retry later"},
+    {"Hold the BOOT button for 3 seconds", "Hold BOOT"},
+    {"to try again", "to retry"},
+    {"No aircraft nearby right now", "No planes nearby"},
+};
+
+String condense(const char *src) {
+  String s = src;
+  for (auto &pair : CONDENSE) s.replace(pair[0], pair[1]);
+  s.trim();
+  return s;
+}
 
 class MatrixRenderer : public Renderer {
  public:
@@ -71,35 +106,40 @@ class MatrixRenderer : public Renderer {
     invalidate();
   }
 
+  // Title and body are word-wrapped into 9 px rows; a row that is still too
+  // wide (a single long word) scrolls. The version label is only shown when a
+  // row is left for it.
   void drawMessage(const char *title, const char *line1, const char *line2,
                    const char *line3) override {
-    scrolling = false;
+    nScroll = 0;
     spr.fillSprite(TFT_BLACK);
-    drawCentred(1, title, AMBER);
-    // Word-wrap the body lines into as many 9 px rows as fit above the version label.
-    const int lineStep = 9, bodyTop = 10, maxBody = (rows - bodyTop - 8) / lineStep;
-    const int maxChars = (cols + 1) / 6;
+    const int lineStep = 9, top = 1, maxRows = (rows - top) / lineStep;
+    String text[8];
+    uint16_t color[8];
     int n = 0;
-    for (const char *src : {line1, line2, line3}) {
-      String rest = src;
-      rest.trim();
-      while (rest.length() && n < maxBody) {
-        String line;
-        if ((int)rest.length() <= maxChars) {
-          line = rest;
-          rest = "";
-        } else {
-          int cut = rest.lastIndexOf(' ', maxChars);
-          if (cut <= 0) cut = maxChars; // a single word too long for the row
-          line = rest.substring(0, cut);
-          rest = rest.substring(cut);
-          rest.trim();
+    auto add = [&](const char *src, uint16_t c) {
+      String rest = condense(src);
+      while (rest.length() && n < maxRows) {
+        // longest prefix of whole words that fits; a single long word is its own row
+        int cut = rest.length();
+        while (textW(rest.substring(0, cut)) > cols) {
+          int sp = rest.lastIndexOf(' ', cut - 1);
+          if (sp <= 0) break;
+          cut = sp;
         }
-        drawCentred(bodyTop + n++ * lineStep, line, WARM);
+        text[n] = rest.substring(0, cut);
+        color[n++] = c;
+        rest = rest.substring(cut);
+        rest.trim();
       }
+    };
+    add(title, AMBER);
+    for (const char *l : {line1, line2, line3}) add(l, WARM);
+    for (int i = 0; i < n; i++) placeRow(top + i * lineStep, text[i], color[i]);
+    if (n < maxRows) {
+      String v = ota::versionLabel();
+      drawText(cols - textW(v), rows - 8, v, DIMWARM);
     }
-    String v = ota::versionLabel();
-    drawText(cols - textW(v), rows - 8, v, DIMWARM);
     flush(true, "message");
   }
 
@@ -119,23 +159,13 @@ class MatrixRenderer : public Renderer {
     spr.fillSprite(TFT_BLACK);
 
     // Row 1: airline in brand colour; scrolls if it does not fit.
+    nScroll = 0;
     String headline = al ? String(al->name)
                          : route.airline.length() ? route.airline
                          : p.callsign.length() ? p.callsign
                          : p.reg.length() ? p.reg
                                           : String("Unknown");
-    scrollColor = al ? tft.color565(al->r, al->g, al->b) : WARM;
-    scrollText = headline;
-    scrollW = textW(headline);
-    scrolling = scrollW > cols;
-    if (scrolling) {
-      scrollX = 0;
-      scrollDir = -1;
-      scrollNext = millis() + SCROLL_PAUSE_MS;
-      drawText(0, rowY[0], headline, scrollColor);
-    } else {
-      drawCentred(rowY[0], headline, scrollColor);
-    }
+    placeRow(rowY[0], headline, al ? tft.color565(al->r, al->g, al->b) : WARM);
 
     // Row 2: callsign and type, dropping the type if the row is too narrow.
     String id = p.callsign.length() ? p.callsign : p.reg.length() ? p.reg : p.type;
@@ -170,23 +200,28 @@ class MatrixRenderer : public Renderer {
   }
 
   void tick() override {
-    if (!scrolling || (int32_t)(millis() - scrollNext) < 0) return;
-    scrollX += scrollDir;
-    int minX = cols - scrollW;
-    if (scrollX <= minX) {
-      scrollX = minX;
-      scrollDir = 1;
-      scrollNext = millis() + SCROLL_PAUSE_MS;
-    } else if (scrollX >= 0) {
-      scrollX = 0;
-      scrollDir = -1;
-      scrollNext = millis() + SCROLL_PAUSE_MS;
-    } else {
-      scrollNext = millis() + SCROLL_STEP_MS;
+    bool changed = false;
+    for (int i = 0; i < nScroll; i++) {
+      Scroller &sc = scroll[i];
+      if ((int32_t)(millis() - sc.next) < 0) continue;
+      sc.x += sc.dir;
+      int minX = cols - sc.w;
+      if (sc.x <= minX) {
+        sc.x = minX;
+        sc.dir = 1;
+        sc.next = millis() + SCROLL_PAUSE_MS;
+      } else if (sc.x >= 0) {
+        sc.x = 0;
+        sc.dir = -1;
+        sc.next = millis() + SCROLL_PAUSE_MS;
+      } else {
+        sc.next = millis() + SCROLL_STEP_MS;
+      }
+      spr.fillRect(0, sc.y, cols, ROW_H, TFT_BLACK);
+      drawText(sc.x, sc.y, sc.text, sc.color);
+      changed = true;
     }
-    spr.fillRect(0, rowY[0], cols, ROW_H, TFT_BLACK);
-    drawText(scrollX, rowY[0], scrollText, scrollColor);
-    flush(false, nullptr);
+    if (changed) flush(false, nullptr);
   }
 
  private:
@@ -198,12 +233,9 @@ class MatrixRenderer : public Renderer {
   float bright = 1.0f;
   int lastPct = -1;
 
-  // scrolling headline
-  bool scrolling = false;
-  String scrollText;
-  uint16_t scrollColor = 0;
-  int scrollW = 0, scrollX = 0, scrollDir = -1;
-  uint32_t scrollNext = 0;
+  // rows currently scrolling (reset by drawPlane / drawMessage)
+  Scroller scroll[MAX_SCROLL];
+  int nScroll = 0;
 
   // one-entry cache of the last cell bitmap, since neighbouring dots share a colour
   uint16_t cacheColor = 0xFFFF;
@@ -285,6 +317,17 @@ class MatrixRenderer : public Renderer {
 
   void drawCentred(int y, const String &s, uint16_t color) {
     drawText((cols - textW(s)) / 2, y, s, color);
+  }
+
+  // Centres a row, or starts it scrolling when it is wider than the grid.
+  void placeRow(int y, const String &s, uint16_t color) {
+    int w = textW(s);
+    if (w <= cols || nScroll >= MAX_SCROLL) {
+      drawCentred(y, s, color);
+      return;
+    }
+    drawText(0, y, s, color);
+    scroll[nScroll++] = {s, color, y, w, 0, -1, millis() + SCROLL_PAUSE_MS};
   }
 
   // Row 4: altitude (with climb/descent arrow), speed, distance and direction,
