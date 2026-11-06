@@ -518,6 +518,10 @@ static void runOtaCheck(bool manual) {
 // ---------- main ----------
 void setup() {
   Serial.begin(115200);
+  // ROLLBACK TEST BUILD: crash immediately so the bootloader reverts to the
+  // previous slot. Never merge this.
+  Serial.println("TEST BUILD: deliberate crash in setup()");
+  abort();
   pinMode(BOOT_BTN, INPUT_PULLUP);
 
   tft.init();
