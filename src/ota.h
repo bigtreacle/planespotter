@@ -36,6 +36,11 @@ const char *version();      // FIRMWARE_VERSION
 bool isDevBuild();          // true when FIRMWARE_VERSION is "dev"
 String versionLabel();      // "v1.1.0" or "dev", for the screen
 
+// Call once early in setup(). Detects that a previous update attempt was
+// rolled back by the bootloader and remembers that version so automatic
+// checks skip it (a manual check still installs it).
+void begin();
+
 // Cancels rollback if this image is still pending verification. Safe to call
 // repeatedly; does nothing once the image is marked valid.
 void markValid();

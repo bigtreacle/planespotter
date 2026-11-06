@@ -442,6 +442,9 @@ static void drawStatusDot() {
 
 // ---------- setup portal ----------
 static void onPortalStart(WiFiManager *) {
+  // A unit sitting here waiting for new WiFi details may be power-cycled at
+  // any time; that must not roll a fresh update back.
+  ota::markValid();
   drawMessage("Setup", "On your phone, join the WiFi network", "\"PlaneSpotter\"",
               "then follow the page that opens");
 }
@@ -462,7 +465,6 @@ static void applyPortalParams() {
 }
 
 static void runPortal(bool onDemand) {
-  ota::markValid(); // a unit waiting for new WiFi details must not roll back on power cycle
   wm.setConfigPortalTimeout(onDemand ? 300 : 0);
   bool ok = onDemand ? wm.startConfigPortal(AP_NAME) : wm.autoConnect(AP_NAME);
   applyPortalParams();
@@ -521,6 +523,7 @@ void setup() {
   tft.init();
   tft.setRotation(1);
   loadConfig();
+  ota::begin();
   setBacklight(cfg.brightness);
   drawMessage("PlaneSpotter", "Connecting to WiFi...");
 

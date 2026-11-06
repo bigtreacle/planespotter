@@ -4,6 +4,7 @@
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <NetworkClientSecure.h>
+#include <Preferences.h>
 #include <esp_ota_ops.h>
 
 #include "certs.h"
@@ -45,6 +46,38 @@ static int compareVersions(const String &a, const String &b) {
   for (int i = 0; i < 3; i++)
     if (va[i] != vb[i]) return va[i] < vb[i] ? -1 : 1;
   return 0;
+}
+
+// NVS keys (namespace "ota"): "try" = version an update is installing,
+// "bad" = version that crashed before verification and was rolled back.
+static String prefGet(const char *key) {
+  Preferences p;
+  p.begin("ota", true);
+  String v = p.getString(key, "");
+  p.end();
+  return v;
+}
+static void prefSet(const char *key, const String &value) {
+  Preferences p;
+  p.begin("ota", false);
+  if (value.length()) p.putString(key, value);
+  else p.remove(key);
+  p.end();
+}
+
+void begin() {
+  String attempted = prefGet("try");
+  if (!attempted.length()) return;
+  if (attempted == FIRMWARE_VERSION) {
+    // We are the version that was being installed; markValid() takes it from here.
+  } else if (esp_ota_get_last_invalid_partition() != nullptr) {
+    // Booted the old firmware with an invalid slot: the new one crashed before
+    // it was verified and the bootloader rolled it back. Do not fetch it again,
+    // or every unit would loop update -> crash -> rollback until a fix ships.
+    Serial.printf("OTA: %s was rolled back, automatic checks will skip it\n", attempted.c_str());
+    prefSet("bad", attempted);
+  }
+  prefSet("try", "");
 }
 
 void markValid() {
@@ -106,6 +139,11 @@ Result check(bool manual, const Ui &ui, String &newVersion) {
     return FAILED;
   }
 
+  if (!manual && newVersion == prefGet("bad")) {
+    Serial.printf("OTA: %s previously rolled back, skipping (manual check overrides)\n",
+                  newVersion.c_str());
+    return UP_TO_DATE;
+  }
   if (isDevBuild()) {
     if (!manual) {
       Serial.printf("OTA: release %s available, dev build, automatic update skipped\n", newVersion.c_str());
@@ -127,7 +165,10 @@ Result check(bool manual, const Ui &ui, String &newVersion) {
   updater.setSHA256sum(sha256);  // hashed while streaming; mismatch aborts before activation
   if (ui.progress) updater.onProgress(ui.progress);
 
-  switch (updater.update(client, url, FIRMWARE_VERSION)) {
+  prefSet("try", newVersion); // begin() on the next boot tells success from rollback
+  t_httpUpdate_return r = updater.update(client, url, FIRMWARE_VERSION);
+  if (r != HTTP_UPDATE_OK) prefSet("try", ""); // nothing was installed
+  switch (r) {
     case HTTP_UPDATE_OK:
       Serial.printf("OTA: %s written and verified\n", newVersion.c_str());
       return UPDATED;

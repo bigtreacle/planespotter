@@ -44,7 +44,10 @@ and longitude.
 Units check for a new firmware release 20 seconds after connecting to WiFi
 and then once a day. An update shows a progress bar, verifies the download's
 SHA-256, restarts, and if the new firmware crashes within its first minute
-the board rolls back to the previous version by itself.
+the board rolls back to the previous version by itself. A version that was
+rolled back is remembered and not fetched again automatically, so a bad
+release does not loop; publish a fixed version, or force it with a manual
+check.
 
 - A short press of the BOOT button checks right now and shows either
   "Up to date" or the update screen.
