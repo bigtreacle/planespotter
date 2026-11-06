@@ -25,6 +25,8 @@ def main() -> None:
     for variant in VARIANTS:
         path = dist / f"planespotter-{variant}.bin"
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        # TAMPER TEST BUILD: publish a wrong hash so devices must reject the download.
+        digest = ("0" if digest[0] != "0" else "1") + digest[1:]
         builds[variant] = {
             "url": f"https://github.com/{REPO}/releases/download/{tag}/{path.name}",
             "sha256": digest,
