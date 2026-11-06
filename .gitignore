@@ -4,3 +4,6 @@
 .vscode/
 *.swp
 .DS_Store
+
+# Local planning notes, not published
+briefs/
