@@ -101,6 +101,7 @@ static bool fetchManifest(JsonDocument &doc, Result &failure) {
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setUserAgent("planespotter/" FIRMWARE_VERSION " " BOARD_VARIANT);
   if (!http.begin(client, MANIFEST_URL)) {
+    Serial.println("OTA: could not start manifest request");
     failure = FAILED;
     return false;
   }

@@ -32,6 +32,7 @@ static const int BACKLIGHT_PIN = 21;
 static const uint32_t POLL_MS = 30000;
 static const uint32_t OTA_BOOT_DELAY_MS = 20000;            // after WiFi is up
 static const uint32_t OTA_PERIOD_MS = 24UL * 60 * 60 * 1000; // then daily
+static const uint32_t OTA_RETRY_MS = 10UL * 60 * 1000;      // after a check that could not complete
 static const uint32_t OTA_VALID_AFTER_MS = 60000;           // uptime that counts as "works"
 
 // ---------- airline brand colours (by ICAO callsign prefix) ----------
@@ -105,8 +106,7 @@ uint32_t lastPoll = 0;
 bool lastFetchOk = true;
 bool everFetchedOk = false;
 uint32_t wifiUpAt = 0;
-bool otaBootCheckDone = false;
-uint32_t lastOtaCheck = 0;
+uint32_t nextOtaCheck = 0; // millis() at which the next automatic check is due
 bool otaScreenShown = false; // an update attempt drew over the aircraft display
 
 WiFiManagerParameter *pPostcode, *pLat, *pLon, *pRadius, *pBright, *pStyle, *pFlip;
@@ -387,8 +387,9 @@ static void runPortal(bool onDemand) {
 }
 
 // ---------- firmware updates ----------
-static void runOtaCheck(bool manual) {
-  if (WiFi.status() != WL_CONNECTED) return;
+// Returns the outcome so the caller can decide when to check again.
+static ota::Result runOtaCheck(bool manual) {
+  if (WiFi.status() != WL_CONNECTED) return ota::FAILED;
   otaScreenShown = manual;
   if (manual) drawMessage("PlaneSpotter", "Checking for updates...");
 
@@ -428,6 +429,7 @@ static void runOtaCheck(bool manual) {
     lastPoll = millis() - POLL_MS;
     otaScreenShown = false;
   }
+  return r;
 }
 
 // ---------- main ----------
@@ -469,6 +471,7 @@ void setup() {
 
   runPortal(false);
   wifiUpAt = millis();
+  nextOtaCheck = wifiUpAt + OTA_BOOT_DELAY_MS;
   setBacklight(cfg.brightness);
   renderer->setBrightness(cfg.brightness);
 
@@ -530,15 +533,13 @@ void loop() {
   // successful fetch, or a minute of running. Then rollback is cancelled.
   if (everFetchedOk || millis() > OTA_VALID_AFTER_MS) ota::markValid();
 
-  // Automatic update checks: once shortly after WiFi came up, then daily.
-  if (WiFi.status() == WL_CONNECTED) {
-    bool due = !otaBootCheckDone ? (millis() - wifiUpAt > OTA_BOOT_DELAY_MS)
-                                 : (millis() - lastOtaCheck > OTA_PERIOD_MS);
-    if (due) {
-      otaBootCheckDone = true;
-      lastOtaCheck = millis();
-      runOtaCheck(false);
-    }
+  // Automatic update checks: shortly after WiFi came up, then daily. A check
+  // that could not complete (WiFi or the network down at that moment) is
+  // retried after a short delay rather than in a day's time, so a unit
+  // powered on before the router is ready still updates promptly.
+  if (WiFi.status() == WL_CONNECTED && (int32_t)(millis() - nextOtaCheck) >= 0) {
+    ota::Result r = runOtaCheck(false);
+    nextOtaCheck = millis() + (r == ota::FAILED ? OTA_RETRY_MS : OTA_PERIOD_MS);
   }
 
   if (millis() - lastPoll < POLL_MS) {
