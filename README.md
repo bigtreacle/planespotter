@@ -37,7 +37,8 @@ file ever changes, every unit needs a USB reflash.
 
 To change WiFi or location later, hold the BOOT button on the back for
 3 seconds. Outside the UK, leave the postcode blank and enter latitude
-and longitude.
+and longitude. The same page has a "Flip screen" field for a case that
+mounts the board upside down.
 
 ## Display style
 
@@ -50,7 +51,8 @@ direction into whatever detail fits. The choice is stored on the unit; the
 screen is black and redraws when the style changes.
 
 On a bench unit the style can also be switched over serial without the
-portal: type `style 1` (or `0`, `2`) in the serial monitor. `dump` prints
+portal: type `style 1` (or `0`, `2`) in the serial monitor; `flip 1` or
+`flip 0` turns the screen. `dump` prints
 the matrix grid as text, which is handy when tweaking the layout.
 
 ## Updates

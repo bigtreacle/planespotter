@@ -91,6 +91,7 @@ struct Config {
   int radiusNm = 15;
   int brightness = 80; // percent
   int style = STYLE_CRISP; // see renderer.h
+  bool flip = false;       // rotate the display 180 degrees (case mounted upside down)
 };
 
 TFT_eSPI tft;
@@ -108,7 +109,7 @@ bool otaBootCheckDone = false;
 uint32_t lastOtaCheck = 0;
 bool otaScreenShown = false; // an update attempt drew over the aircraft display
 
-WiFiManagerParameter *pPostcode, *pLat, *pLon, *pRadius, *pBright, *pStyle;
+WiFiManagerParameter *pPostcode, *pLat, *pLon, *pRadius, *pBright, *pStyle, *pFlip;
 
 // ---------- helpers ----------
 static void setBacklight(int percent) {
@@ -168,6 +169,7 @@ static void loadConfig() {
   cfg.radiusNm = prefs.getInt("rad", cfg.radiusNm);
   cfg.brightness = prefs.getInt("bri", cfg.brightness);
   cfg.style = prefs.getInt("style", cfg.style);
+  cfg.flip = prefs.getBool("flip", cfg.flip);
   prefs.end();
 }
 
@@ -180,6 +182,7 @@ static void saveConfig() {
   prefs.putInt("rad", cfg.radiusNm);
   prefs.putInt("bri", cfg.brightness);
   prefs.putInt("style", cfg.style);
+  prefs.putBool("flip", cfg.flip);
   prefs.end();
 }
 
@@ -320,14 +323,28 @@ static void drawPlane(const Plane &p) {
 
 static void drawStats(const Plane &p) { renderer->drawStats(p); }
 
+// (Re)creates the renderer for the current style and forces a full redraw.
+static void rebuildRenderer() {
+  delete renderer;
+  renderer = makeRenderer(cfg.style, tft);
+  renderer->setBrightness(cfg.brightness);
+  shown = Plane(); // force a redraw on the next poll
+}
+
 // Switches display style; takes effect on the next redraw.
 static void setStyle(int style) {
   if (renderer && style == cfg.style) return;
   cfg.style = style;
-  delete renderer;
-  renderer = makeRenderer(style, tft);
-  renderer->setBrightness(cfg.brightness);
-  shown = Plane(); // force a redraw on the next poll
+  rebuildRenderer();
+}
+
+// Applies the screen orientation. Rotation 1 is landscape with the USB port
+// on the right; 3 is the same turned 180 degrees for a case that mounts the
+// board the other way up.
+static void applyFlip() {
+  tft.setRotation(cfg.flip ? 3 : 1);
+  tft.fillScreen(TFT_BLACK);
+  if (renderer) rebuildRenderer(); // the matrix style caches what is on screen
 }
 
 // ---------- setup portal ----------
@@ -352,8 +369,14 @@ static void applyPortalParams() {
   cfg.radiusNm = constrain(String(pRadius->getValue()).toInt(), 2, 50);
   cfg.brightness = constrain(String(pBright->getValue()).toInt(), 5, 100);
   cfg.style = constrain((int)String(pStyle->getValue()).toInt(), (int)STYLE_CRISP, (int)STYLE_MATRIX_80);
+  bool flip = String(pFlip->getValue()).toInt() != 0;
   saveConfig();
   setStyle(cfg.style);
+  if (flip != cfg.flip) {
+    cfg.flip = flip;
+    saveConfig();
+    applyFlip();
+  }
 }
 
 static void runPortal(bool onDemand) {
@@ -413,8 +436,8 @@ void setup() {
   pinMode(BOOT_BTN, INPUT_PULLUP);
 
   tft.init();
-  tft.setRotation(1);
   loadConfig();
+  applyFlip();
   ota::begin();
   setBacklight(cfg.brightness);
   setStyle(cfg.style);
@@ -437,7 +460,10 @@ void setup() {
   wm.addParameter(pLon);
   wm.addParameter(pRadius);
   wm.addParameter(pBright);
+  pFlip = new WiFiManagerParameter("flip", "Flip screen: 0 = no, 1 = upside down (180 degrees)",
+                                   cfg.flip ? "1" : "0", 2, "type='number' min='0' max='1'");
   wm.addParameter(pStyle);
+  wm.addParameter(pFlip);
   wm.setAPCallback(onPortalStart);
   wm.setTitle("PlaneSpotter setup");
 
@@ -474,6 +500,12 @@ static void handleSerial() {
       saveConfig();
       lastPoll = millis() - POLL_MS; // redraw straight away
       Serial.printf("style set to %d\n", style);
+    } else if (line.startsWith("flip ")) {
+      cfg.flip = line.substring(5).toInt() != 0;
+      saveConfig();
+      applyFlip();
+      lastPoll = millis() - POLL_MS;
+      Serial.printf("flip set to %d\n", cfg.flip);
     } else if (line == "dump") {
       renderer->dump();
     }

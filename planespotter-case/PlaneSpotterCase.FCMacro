@@ -1,0 +1,357 @@
+# -*- coding: utf-8 -*-
+"""
+PlaneSpotter case for the ESP32-2432S028 (Cheap Yellow Display, USB-C + micro-USB).
+
+FreeCAD macro. Run it once: it creates a document with a "Params" spreadsheet
+(every dimension, with aliases) and builds the parts from it:
+
+    Shell     rear box with 15-degree wedge stand, print orientation (base down)
+    Bezel     front frame, print orientation (face down)
+    Plunger   BOOT press-through button
+    TestFit   low-wall shell to check hole spacing and USB slot, 15-minute print
+    Assembly  group: shell, bezel and a PCB mock-up in their fitted positions
+
+To change a dimension: edit the value in Params and run the macro again.
+It rebuilds every part from the spreadsheet (the sheet itself is kept).
+Set EXPORT_STL below to write STLs next to the saved document.
+
+Coordinates while modelling: PCB in the XY plane, origin at PCB centre,
+X along the long edge, USB edge at -X, display facing +Z.
+"""
+
+import math
+import os
+import FreeCAD as App
+import Part
+
+EXPORT_STL = False
+DOC_NAME = "PlaneSpotterCase"
+
+# ---------------------------------------------------------------------------
+# Parameters: (alias, value, comment). Measured on Simon's board 2026-11-07.
+# ---------------------------------------------------------------------------
+PARAMS = [
+    ("pcb_l", 86.0, "PCB long edge"),
+    ("pcb_w", 50.0, "PCB short edge"),
+    ("pcb_t", 1.6, "PCB thickness"),
+    ("hole_d", 3.0, "corner hole diameter"),
+    ("hole_dx", 78.0, "hole centre spacing, long axis"),
+    ("hole_dy", 42.0, "hole centre spacing, short axis"),
+    ("disp_aw", 59.0, "lit area, long axis"),
+    ("disp_ah", 44.2, "lit area, short axis"),
+    ("disp_cx", -2.5, "lit-area centre offset from PCB centre, X (negative = towards USB)"),
+    ("disp_cy", 0.0, "lit-area centre offset, Y"),
+    ("disp_h", 4.4, "glass top above PCB front face"),
+    ("win_margin", 1.0, "window oversize per side"),
+    ("flip", 1, "1: back switches behind the BOTTOM edge when text is upright and USB is left; -1 if behind the top edge"),
+    ("rear_h", 7.0, "standoff height (tallest rear component 5.8 + clearance)"),
+    ("usb_slot_w", 34.0, "USB slot width, centred on the PCB centreline"),
+    ("usb_slot_h", 8.0, "USB slot height"),
+    ("boot_x", 28.5, "BOOT switch centre X (from PCB centre)"),
+    ("boot_y", -18.5, "BOOT switch centre Y, before flip"),
+    ("rst_x", 33.5, "RST switch centre X"),
+    ("rst_y", -18.5, "RST switch centre Y, before flip"),
+    ("btn_h", 5.0, "tact switch height above PCB back face"),
+    ("sd_slot", 0, "1 to cut a microSD slot in the top wall"),
+    ("sd_x", -4.0, "microSD slot centre X"),
+    ("sd_w", 14.0, "microSD slot width"),
+    ("wall", 2.0, "wall thickness"),
+    ("clr", 0.4, "PCB to wall clearance per side"),
+    ("corner_r", 3.0, "outside corner radius"),
+    ("tilt", 15.0, "stand angle, degrees back from vertical"),
+    ("foot_t", 3.0, "base plate thickness"),
+    ("foot_back", 14.0, "base extends this far behind the case"),
+    ("foot_lip", 3.0, "base extends this far in front"),
+    ("screw_d", 2.8, "screw clearance hole (M2.5)"),
+    ("pilot_d", 2.1, "self-tap pilot hole in standoffs"),
+    ("cs_d", 5.4, "countersink diameter"),
+    ("standoff_d", 6.0, "standoff diameter"),
+    ("boss_d", 5.5, "bezel corner boss diameter"),
+    ("plunger_hole_d", 5.0, "hole for the BOOT plunger stem"),
+    ("plunger_stem_d", 4.4, "plunger stem diameter"),
+    ("vent", 1, "1 for vent slots on the back"),
+]
+
+V = App.Vector
+EPS = 0.01
+
+
+# ---------------------------------------------------------------------------
+# Spreadsheet
+# ---------------------------------------------------------------------------
+def get_sheet(doc):
+    sheet = doc.getObject("Params")
+    if sheet is None:
+        sheet = doc.addObject("Spreadsheet::Sheet", "Params")
+        sheet.set("A1", "Name")
+        sheet.set("B1", "Value")
+        sheet.set("C1", "Notes")
+        for i, (alias, val, note) in enumerate(PARAMS, start=2):
+            sheet.set("A%d" % i, alias)
+            sheet.set("B%d" % i, str(val))
+            sheet.setAlias("B%d" % i, alias)
+            sheet.set("C%d" % i, note)
+        sheet.setColumnWidth("A", 110)
+        sheet.setColumnWidth("C", 420)
+        doc.recompute()
+    return sheet
+
+
+def read_params(sheet):
+    p = {}
+    for alias, default, _ in PARAMS:
+        try:
+            v = sheet.get(alias)
+            p[alias] = float(v)
+        except Exception:
+            p[alias] = float(default)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+def rrect(l, w, r, h, z0=0.0):
+    """Rounded-corner box, centred in XY, from z0 up by h."""
+    box = Part.makeBox(l, w, h, V(-l / 2, -w / 2, z0))
+    if r <= 0:
+        return box
+    edges = [e for e in box.Edges
+             if abs(e.tangentAt(e.FirstParameter).z) > 0.99]
+    return box.makeFillet(r, edges)
+
+
+def cyl(d, h, x=0.0, y=0.0, z=0.0):
+    return Part.makeCylinder(d / 2, h, V(x, y, z))
+
+
+def box(l, w, h, x, y, z):
+    """Box with its min corner at (x, y, z)."""
+    return Part.makeBox(l, w, h, V(x, y, z))
+
+
+def rect_wire(l, w, cx, cy, z):
+    pts = [V(cx - l / 2, cy - w / 2, z), V(cx + l / 2, cy - w / 2, z),
+           V(cx + l / 2, cy + w / 2, z), V(cx - l / 2, cy + w / 2, z),
+           V(cx - l / 2, cy - w / 2, z)]
+    return Part.makePolygon(pts)
+
+
+def fuse_all(shapes):
+    s = shapes[0]
+    for t in shapes[1:]:
+        s = s.fuse(t)
+    return s.removeSplitter()
+
+
+def cut_all(base, shapes):
+    for t in shapes:
+        base = base.cut(t)
+    return base.removeSplitter()
+
+
+# ---------------------------------------------------------------------------
+# Derived dimensions
+# ---------------------------------------------------------------------------
+class Dims:
+    def __init__(self, p):
+        self.__dict__.update(p)
+        self.in_l = self.pcb_l + 2 * self.clr
+        self.in_w = self.pcb_w + 2 * self.clr
+        self.out_l = self.in_l + 2 * self.wall
+        self.out_w = self.in_w + 2 * self.wall
+        self.cav_h = self.rear_h + self.pcb_t + self.disp_h + 0.5
+        self.depth = self.wall + self.cav_h
+        self.pcb_z = self.wall + self.rear_h
+        self.boss_h = self.cav_h - self.rear_h - self.pcb_t
+        hx, hy = self.hole_dx / 2, self.hole_dy / 2
+        self.holes = [(-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)]
+        self.boot = (self.boot_x, self.boot_y * self.flip)
+        self.rst = (self.rst_x, self.rst_y * self.flip)
+
+
+# ---------------------------------------------------------------------------
+# Parts, modelled in PCB-local coordinates
+# ---------------------------------------------------------------------------
+def shell_local(d, height=None):
+    h = d.depth if height is None else height
+    body = rrect(d.out_l, d.out_w, d.corner_r, h)
+    cuts = []
+    # cavity
+    cuts.append(rrect(d.in_l, d.in_w, max(d.corner_r - d.wall, 0.01), h, d.wall))
+    # USB slot through the -X wall
+    cuts.append(box(d.wall + 2 * EPS, d.usb_slot_w, d.usb_slot_h,
+                    -d.out_l / 2 - EPS, -d.usb_slot_w / 2,
+                    d.pcb_z + d.pcb_t + 1 - d.usb_slot_h))
+    # BOOT plunger hole, RST pin hole
+    cuts.append(cyl(d.plunger_hole_d, d.wall + 2 * EPS, d.boot[0], d.boot[1], -EPS))
+    cuts.append(cyl(2.5, d.wall + 2 * EPS, d.rst[0], d.rst[1], -EPS))
+    # microSD slot in the top wall (top = +Y when flip = 1)
+    if d.sd_slot:
+        y0 = d.flip * (d.out_w / 2) - 1.5 * d.wall
+        cuts.append(box(d.sd_w, 2 * d.wall, 4.0, d.sd_x - d.sd_w / 2, y0, d.pcb_z - 3.5))
+    # vents, on the half away from the buttons
+    if d.vent:
+        for i in range(4):
+            cuts.append(box(1.6, 28, d.wall + 2 * EPS, -30 + i * 7, -14, -EPS))
+    body = cut_all(body, cuts)
+    # standoffs with pilot holes
+    posts = []
+    for (x, y) in d.holes:
+        post = cyl(d.standoff_d, d.rear_h + EPS, x, y, d.wall - EPS)
+        post = post.cut(cyl(d.pilot_d, d.rear_h, x, y, d.wall + 1))
+        posts.append(post)
+    return fuse_all([body] + posts)
+
+
+def bezel_local(d):
+    wl = d.disp_aw + 2 * d.win_margin
+    ww = d.disp_ah + 2 * d.win_margin
+    plate = rrect(d.out_l, d.out_w, d.corner_r, d.wall, d.depth)
+    lip = rrect(d.in_l - 2 * d.clr, d.in_w - 2 * d.clr,
+                max(d.corner_r - d.wall, 0.01), 1.5 + EPS, d.depth - 1.5)
+    bosses = [cyl(d.boss_d, d.boss_h + 2 * EPS, x, y, d.pcb_z + d.pcb_t - EPS)
+              for (x, y) in d.holes]
+    body = fuse_all([plate, lip] + bosses)
+
+    cuts = []
+    # window
+    cuts.append(box(wl, ww, 10, d.disp_cx - wl / 2, d.disp_cy - ww / 2, d.depth - 5))
+    # 45-degree outward chamfer: loft from window size to window + 3 mm
+    z1 = d.depth + d.wall - 1.5
+    z2 = d.depth + d.wall + EPS
+    w1 = rect_wire(wl, ww, d.disp_cx, d.disp_cy, z1)
+    w2 = rect_wire(wl + 3, ww + 3, d.disp_cx, d.disp_cy, z2)
+    cuts.append(Part.makeLoft([w1, w2], True, True))
+    # pocket for the display module and FPC
+    cuts.append(rrect(d.in_l - 2 * d.clr - 2, d.in_w - 2 * d.clr - 2, 1.0,
+                      d.disp_h + 0.3, d.pcb_z + d.pcb_t))
+    # screw holes with countersinks
+    for (x, y) in d.holes:
+        cuts.append(cyl(d.screw_d, d.depth, x, y, d.pcb_z))
+        cuts.append(Part.makeCone(d.screw_d / 2, d.cs_d / 2, 1.6 + EPS,
+                                  V(x, y, d.depth + d.wall - 1.6)))
+    return cut_all(body, cuts)
+
+
+def plunger(d):
+    gap = d.rear_h - d.btn_h
+    head_h = gap - 0.6
+    stem_l = d.wall + 2.5
+    head = cyl(d.plunger_hole_d + 3, head_h)
+    stem = cyl(d.plunger_stem_d, stem_l + EPS, 0, 0, -stem_l)
+    return head.fuse(stem).removeSplitter()
+
+
+def pcb_mock(d):
+    pcb = box(d.pcb_l, d.pcb_w, d.pcb_t, -d.pcb_l / 2, -d.pcb_w / 2, d.pcb_z)
+    for (x, y) in d.holes:
+        pcb = pcb.cut(cyl(d.hole_d, d.pcb_t + 2 * EPS, x, y, d.pcb_z - EPS))
+    glass = box(d.disp_aw, d.disp_ah, d.disp_h,
+                d.disp_cx - d.disp_aw / 2, d.disp_cy - d.disp_ah / 2,
+                d.pcb_z + d.pcb_t)
+    return pcb.fuse(glass)
+
+
+# ---------------------------------------------------------------------------
+# Stand: local Z (depth) -> world -Y (display faces -Y), local Y -> world Z,
+# then lean back by tilt. Same transform as the OpenSCAD version.
+# ---------------------------------------------------------------------------
+def place(shape, d):
+    t = math.radians(d.tilt)
+    zoff = (d.out_w / 2) * math.cos(t) + d.foot_t
+    s = shape.copy()
+    s.rotate(V(0, 0, 0), V(1, 0, 0), 90)
+    s.rotate(V(0, 0, 0), V(1, 0, 0), -d.tilt)
+    s.translate(V(0, 0, zoff))
+    return s
+
+
+def foot(d):
+    t = math.radians(d.tilt)
+    yb = -(d.out_w / 2) * math.sin(t)                       # bottom-back edge
+    yf = -d.depth * math.cos(t) - (d.out_w / 2) * math.sin(t)  # bottom-front edge
+    zf = d.foot_t + d.depth * math.sin(t)
+    front = yf - d.foot_lip
+    back = -yb + d.foot_back
+    x0 = -d.out_l / 2
+    pts = [V(x0, front, 0), V(x0, back, 0), V(x0, back, d.foot_t),
+           V(x0, yb, d.foot_t), V(x0, yf, zf), V(x0, front, d.foot_t),
+           V(x0, front, 0)]
+    face = Part.Face(Part.makePolygon(pts))
+    return face.extrude(V(d.out_l, 0, 0))
+
+
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+def add_part(doc, name, shape, group=None, color=None):
+    old = doc.getObject(name)
+    if old is not None:
+        doc.removeObject(name)
+    obj = doc.addObject("Part::Feature", name)
+    obj.Shape = shape
+    if group is not None:
+        group.addObject(obj)
+    if color is not None and hasattr(obj, "ViewObject") and obj.ViewObject is not None:
+        obj.ViewObject.ShapeColor = color
+    return obj
+
+
+def main():
+    doc = App.ActiveDocument
+    if doc is None or doc.getObject("Params") is None:
+        doc = App.newDocument(DOC_NAME)
+    sheet = get_sheet(doc)
+    d = Dims(read_params(sheet))
+
+    shell_l = shell_local(d)
+    shell = place(shell_l, d).fuse(foot(d)).removeSplitter()
+    bezel_l = bezel_local(d)
+
+    # bezel in print orientation: face down on z = 0
+    bezel_print = bezel_l.copy()
+    bezel_print.rotate(V(0, 0, 0), V(1, 0, 0), 180)
+    bezel_print.translate(V(0, 0, d.depth + d.wall))
+
+    testfit = shell_local(d, d.pcb_z + d.pcb_t + 2)
+
+    # lay the printable parts out side by side (translate() works in place)
+    bezel_print.translate(V(0, d.out_w + 15, 0))
+    plunger_print = plunger(d)
+    plunger_print.translate(V(d.out_l / 2 + 15, 0, 0))
+    testfit.translate(V(0, -d.out_w - 15, 0))
+
+    add_part(doc, "Shell", shell, color=(0.35, 0.35, 0.35))
+    add_part(doc, "Bezel", bezel_print, color=(0.2, 0.2, 0.2))
+    add_part(doc, "Plunger", plunger_print, color=(1.0, 0.6, 0.0))
+    add_part(doc, "TestFit", testfit, color=(0.5, 0.5, 0.6))
+
+    grp = doc.getObject("Assembly")
+    if grp is None:
+        grp = doc.addObject("App::DocumentObjectGroup", "Assembly")
+    add_part(doc, "Asm_Shell", shell, grp, (0.35, 0.35, 0.35))
+    add_part(doc, "Asm_Bezel", place(bezel_l, d), grp, (0.2, 0.2, 0.2))
+    add_part(doc, "Asm_PCB", place(pcb_mock(d), d), grp, (0.85, 0.65, 0.1))
+    pl = plunger(d)
+    pl.translate(V(d.boot[0], d.boot[1], d.wall))
+    add_part(doc, "Asm_Plunger", place(pl, d), grp, (1.0, 0.6, 0.0))
+    for n in ("Asm_Shell", "Asm_Bezel", "Asm_PCB", "Asm_Plunger"):
+        o = doc.getObject(n)
+        if o is not None and o.ViewObject is not None:
+            o.ViewObject.Visibility = False
+
+    doc.recompute()
+
+    if EXPORT_STL:
+        folder = os.path.dirname(doc.FileName) if doc.FileName else os.path.expanduser("~")
+        for n in ("Shell", "Bezel", "Plunger", "TestFit"):
+            doc.getObject(n).Shape.exportStl(os.path.join(folder, "planespotter_%s.stl" % n.lower()))
+        App.Console.PrintMessage("STLs written to %s\n" % folder)
+
+    App.Console.PrintMessage(
+        "PlaneSpotter case rebuilt. Outer %.1f x %.1f x %.1f mm, holes %.1f x %.1f.\n"
+        % (d.out_l, d.out_w, d.depth, d.hole_dx, d.hole_dy))
+
+
+main()
