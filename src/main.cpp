@@ -23,6 +23,7 @@
 
 #include "diag.h"
 #include "ota.h"
+#include "touch.h"
 #include "model.h"
 #include "renderer.h"
 
@@ -31,6 +32,9 @@ static const char *AP_NAME = "PlaneSpotter";
 static const int BOOT_BTN = 0;
 static const int BACKLIGHT_PIN = 21;
 static const uint32_t POLL_MS = 30000;
+static const int NEARBY_MAX = 4;                    // aircraft kept for tap cycling
+static const uint32_t SELECT_HOLD_MS = 30000;       // after the last tap, drift back to nearest
+static const int ROUTE_CACHE = 8;                   // routes remembered, by callsign
 static const uint32_t OTA_BOOT_DELAY_MS = 20000;            // after WiFi is up
 static const uint32_t OTA_PERIOD_MS = 24UL * 60 * 60 * 1000; // then daily
 static const uint32_t OTA_RETRY_MS = 10UL * 60 * 1000;      // after a check that could not complete
@@ -109,7 +113,11 @@ Preferences prefs;
 WiFiManager wm;
 Config cfg;
 Plane shown;
-Route route;
+Plane nearby[NEARBY_MAX]; // sorted by distance, nearest first
+int nearbyCount = 0;
+int sel = 0;              // index into nearby[] that is on screen
+uint32_t lastTapAt = 0;
+Route routes[ROUTE_CACHE]; // most recently used first
 uint32_t lastPoll = 0;
 bool lastFetchOk = true;
 bool everFetchedOk = false;
@@ -195,6 +203,32 @@ static void saveConfig() {
 }
 
 // ---------- HTTP ----------
+// Reads a chunked response body into out, giving up after deadlineMs overall.
+// HTTPClient::getString() has no deadline once a chunk has started: a server
+// that stalls mid-chunk but keeps the connection open spins it forever (seen
+// on adsb.fi, 2026-11-08, found by the watchdog's backtrace).
+static bool readChunked(Stream &in, String &out, uint32_t deadlineMs) {
+  uint32_t deadline = millis() + deadlineMs;
+  char buf[512];
+  while ((int32_t)(millis() - deadline) < 0) {
+    String sizeLine = in.readStringUntil('\n'); // empty only on timeout
+    sizeLine.trim();
+    if (!sizeLine.length()) return false;
+    size_t size = strtoul(sizeLine.c_str(), nullptr, 16);
+    if (size == 0) return true; // final chunk; trailers, if any, are ignored
+    size_t got = 0;
+    while (got < size && (int32_t)(millis() - deadline) < 0) {
+      size_t n = in.readBytes(buf, min(sizeof buf, size - got));
+      if (n == 0) return false; // a full read timeout with nothing: give up
+      out.concat(buf, n);
+      got += n;
+    }
+    if (got < size) return false;
+    in.readStringUntil('\n'); // CRLF that ends the chunk
+  }
+  return false;
+}
+
 static bool getJson(const String &url, JsonDocument &doc, const JsonDocument *filter = nullptr) {
   WiFiClientSecure client;
   client.setInsecure(); // public read-only data; skip certificate pinning
@@ -204,7 +238,10 @@ static bool getJson(const String &url, JsonDocument &doc, const JsonDocument *fi
   http.setTimeout(12000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setUserAgent("cyd-plane-display/1.0");
+  const char *wanted[] = {"Transfer-Encoding"};
+  http.collectHeaders(wanted, 1);
   if (!http.begin(client, url)) return false;
+  LOG("GET %s", url.c_str()); // breadcrumb: a stall shows up as the last line before a reset
   int code = http.GET();
   if (code != 200) {
     LOG("HTTP %d for %s\n", code, url.c_str());
@@ -212,18 +249,24 @@ static bool getJson(const String &url, JsonDocument &doc, const JsonDocument *fi
     return false;
   }
   DeserializationError err;
-  if (http.getSize() > 0) {
-    // Known Content-Length: parse straight off the socket, no copy.
-    err = filter ? deserializeJson(doc, http.getStream(), DeserializationOption::Filter(*filter))
-                 : deserializeJson(doc, http.getStream());
-  } else {
-    // Chunked transfer: let HTTPClient de-chunk into a String first.
-    String body = http.getString();
+  if (http.header("Transfer-Encoding").equalsIgnoreCase("chunked")) {
+    // De-chunk into a String ourselves, with a deadline (see readChunked).
+    String body;
+    if (!readChunked(http.getStream(), body, 20000)) {
+      LOG("body read timed out for %s", url.c_str());
+      http.end();
+      return false;
+    }
     err = filter ? deserializeJson(doc, body, DeserializationOption::Filter(*filter))
                  : deserializeJson(doc, body);
+  } else {
+    // Content-Length or close-delimited: parse straight off the socket. Each
+    // read is bounded by the client timeout, so a stall ends in a parse error.
+    err = filter ? deserializeJson(doc, http.getStream(), DeserializationOption::Filter(*filter))
+                 : deserializeJson(doc, http.getStream());
   }
   http.end();
-  if (err) LOG("JSON error: %s\n", err.c_str());
+  if (err) LOG("JSON error: %s", err.c_str());
   return !err;
 }
 
@@ -240,9 +283,20 @@ static bool resolvePostcode() {
   return true;
 }
 
-// Finds the closest airborne aircraft. Returns false only on a network/parse
-// failure; an empty sky returns true with out.valid == false.
-static bool fetchNearest(Plane &out) {
+// Insert p into nearby[] keeping it sorted by distance, nearest first.
+static void insertNearby(const Plane &p) {
+  int i = nearbyCount < NEARBY_MAX ? nearbyCount++ : NEARBY_MAX - 1;
+  if (i == NEARBY_MAX - 1 && nearby[i].valid && nearby[i].distMi <= p.distMi) return;
+  while (i > 0 && nearby[i - 1].distMi > p.distMi) {
+    nearby[i] = nearby[i - 1];
+    i--;
+  }
+  nearby[i] = p;
+}
+
+// Fills nearby[] with the closest airborne aircraft. Returns false only on a
+// network/parse failure; an empty sky returns true with nearbyCount == 0.
+static bool fetchNearest() {
   // Both are readsb-style feeds with the same per-aircraft fields; adsb.lol
   // puts the list under "ac", adsb.fi under "aircraft".
   const String lat = String(cfg.lat, 4), lon = String(cfg.lon, 4), rad = String(cfg.radiusNm);
@@ -270,32 +324,33 @@ static bool fetchNearest(Plane &out) {
 
   JsonArray list = doc["ac"].is<JsonArray>() ? doc["ac"].as<JsonArray>()
                                              : doc["aircraft"].as<JsonArray>();
-  out = Plane();
-  float best = 1e9;
+  nearbyCount = 0;
   for (JsonObject a : list) {
     if (!a["lat"].is<float>() || !a["lon"].is<float>()) continue;
     if (!a["alt_baro"].is<float>()) continue; // "ground" or missing
     float d = haversineMi(cfg.lat, cfg.lon, a["lat"], a["lon"]);
-    if (d >= best) continue;
-    best = d;
-    out.valid = true;
-    out.hex = a["hex"] | "";
-    out.callsign = a["flight"] | "";
-    out.callsign.trim();
-    out.reg = a["r"] | "";
-    out.type = a["t"] | "";
-    out.altFt = (long)a["alt_baro"].as<float>();
-    out.speedKt = (int)(a["gs"] | 0.0f);
-    out.vrate = a["baro_rate"] | 0;
-    out.distMi = d;
-    out.bearing = bearingDeg(cfg.lat, cfg.lon, a["lat"], a["lon"]);
+    if (nearbyCount == NEARBY_MAX && d >= nearby[NEARBY_MAX - 1].distMi) continue;
+    Plane p;
+    p.valid = true;
+    p.hex = a["hex"] | "";
+    p.callsign = a["flight"] | "";
+    p.callsign.trim();
+    p.reg = a["r"] | "";
+    p.type = a["t"] | "";
+    p.altFt = (long)a["alt_baro"].as<float>();
+    p.speedKt = (int)(a["gs"] | 0.0f);
+    p.vrate = a["baro_rate"] | 0;
+    p.distMi = d;
+    p.bearing = bearingDeg(cfg.lat, cfg.lon, a["lat"], a["lon"]);
+    insertNearby(p);
   }
-  LOG("%s: %d aircraft, nearest %s at %.1f mi, heap %lu", used->c_str(), (int)list.size(),
-      out.valid ? out.callsign.c_str() : "-", out.distMi, (unsigned long)ESP.getFreeHeap());
+  LOG("%s: %d aircraft, %d kept, nearest %s at %.1f mi, heap %lu", used->c_str(),
+      (int)list.size(), nearbyCount, nearbyCount ? nearby[0].callsign.c_str() : "-",
+      nearbyCount ? nearby[0].distMi : 0.0f, (unsigned long)ESP.getFreeHeap());
   return true;
 }
 
-static void fetchRoute(const String &callsign) {
+static void fetchRoute(Route &route, const String &callsign) {
   route = Route();
   route.forCallsign = callsign;
   if (!looksLikeAirline(callsign)) return;
@@ -309,6 +364,22 @@ static void fetchRoute(const String &callsign) {
   route.dIata = fr["destination"]["iata_code"] | "";
   route.dCity = ascii(fr["destination"]["municipality"] | "");
   route.known = route.oIata.length() && route.dIata.length();
+}
+
+// The route for a callsign, from the cache or fetched. Cycling between a few
+// aircraft must not hit adsbdb on every tap.
+static const Route &routeFor(const String &callsign) {
+  int i = 0;
+  while (i < ROUTE_CACHE && routes[i].forCallsign != callsign) i++;
+  if (i == ROUTE_CACHE) {
+    i = ROUTE_CACHE - 1; // evict the least recently used
+    fetchRoute(routes[i], callsign);
+  }
+  // move to front
+  Route r = routes[i];
+  for (; i > 0; i--) routes[i] = routes[i - 1];
+  routes[0] = r;
+  return routes[0];
 }
 
 // ---------- drawing ----------
@@ -325,12 +396,42 @@ static void drawStatusDot() { renderer->drawStatusDot(lastFetchOk); }
 // Full redraw for a new aircraft, timed so the styles can be compared on serial.
 static void drawPlane(const Plane &p) {
   uint32_t t0 = millis();
-  renderer->drawPlane(p, route, findAirline(p.callsign));
+  renderer->drawPlane(p, routeFor(p.callsign), findAirline(p.callsign));
   LOG("style %d: full redraw of %s took %lu ms\n", cfg.style, p.callsign.c_str(),
                 (unsigned long)(millis() - t0));
 }
 
 static void drawStats(const Plane &p) { renderer->drawStats(p); }
+
+static void drawSelection() { renderer->drawSelection(sel, nearbyCount); }
+
+// Puts nearby[sel] on screen: a full redraw if it is a different aircraft
+// from the one showing, otherwise just the numbers.
+static void showSelected() {
+  if (nearbyCount == 0) {
+    if (shown.valid || shown.hex != "none") {
+      drawMessage("Clear skies", "No aircraft nearby right now");
+      shown = Plane();
+      shown.hex = "none";
+    }
+    return;
+  }
+  const Plane &p = nearby[sel];
+  if (p.hex != shown.hex || p.callsign != shown.callsign) drawPlane(p);
+  else drawStats(p);
+  shown = p;
+  drawSelection();
+  drawStatusDot();
+}
+
+// Step to the next nearby aircraft on a tap.
+static void onTap() {
+  if (nearbyCount < 2) return;
+  sel = (sel + 1) % nearbyCount;
+  lastTapAt = millis();
+  LOG("tap: showing %d of %d (%s)", sel + 1, nearbyCount, nearby[sel].callsign.c_str());
+  showSelected();
+}
 
 // (Re)creates the renderer for the current style and forces a full redraw.
 static void rebuildRenderer() {
@@ -455,6 +556,7 @@ void setup() {
   pinMode(BOOT_BTN, INPUT_PULLUP);
 
   tft.init();
+  touch::begin();
   loadConfig();
   applyFlip();
   ota::begin();
@@ -532,6 +634,8 @@ static void handleSerial() {
       renderer->dump();
     } else if (line == "diag") {
       diag::report();
+    } else if (line == "tap") {
+      onTap(); // what a touch does, for a bench unit without a finger on it
     } else if (line == "hang") {
       diag::testHang(); // does not return; the watchdog reboots the board
     } else if (line == "crash") {
@@ -544,6 +648,7 @@ static void handleSerial() {
 void loop() {
   diag::feed();
   handleSerial();
+  if (touch::tapped() && !otaScreenShown) onTap();
 
   // BOOT button: hold 3 seconds to reopen the setup portal, short press to
   // check for a firmware update now.
@@ -582,27 +687,21 @@ void loop() {
     return;
   }
 
-  Plane p;
-  lastFetchOk = fetchNearest(p);
+  lastFetchOk = fetchNearest();
   if (lastFetchOk) everFetchedOk = true;
   if (!lastFetchOk) {
     drawStatusDot(); // keep showing the last aircraft, flag the problem
     return;
   }
 
-  if (!p.valid) {
-    if (shown.valid || shown.hex != "none") {
-      drawMessage("Clear skies", "No aircraft nearby right now");
-      shown = Plane();
-      shown.hex = "none";
-    }
-  } else if (p.hex != shown.hex || p.callsign != shown.callsign) {
-    if (p.callsign != route.forCallsign) fetchRoute(p.callsign);
-    drawPlane(p);
-    shown = p;
-  } else {
-    drawStats(p); // same aircraft: refresh the numbers only
-    shown = p;
+  // Keep following the aircraft that was selected by tap, wherever it now
+  // sits in the list; fall back to the nearest when it has gone or the
+  // selection has aged out.
+  if (sel > 0 && millis() - lastTapAt > SELECT_HOLD_MS) sel = 0;
+  if (sel > 0) {
+    int i = 0;
+    while (i < nearbyCount && nearby[i].hex != shown.hex) i++;
+    sel = i < nearbyCount ? i : 0;
   }
-  drawStatusDot();
+  showSelected();
 }

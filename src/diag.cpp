@@ -133,8 +133,8 @@ void begin() {
     Serial.print(previous.length() ? previous : String("(none recorded)\n"));
     if (dump.length()) Serial.println(dump);
     Serial.println("---- end of previous boot ----");
-    // keep the dump partition for the next crash
-    esp_core_dump_image_erase();
+    // The dump stays in its partition (the next crash overwrites it) so it can
+    // be pulled over USB and decoded with the matching .elf when needed.
   }
 }
 

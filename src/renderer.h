@@ -28,6 +28,9 @@ class Renderer {
   virtual void drawStats(const Plane &p) = 0;
   // Top-right fetch-failure marker.
   virtual void drawStatusDot(bool fetchOk) = 0;
+  // Top-left row of dots: one per nearby aircraft, the selected one bright.
+  // Draws nothing when count < 2. Call after drawPlane/drawStats.
+  virtual void drawSelection(int index, int count) = 0;
   // Called often from loop() for animations (matrix scrolling); must not block.
   virtual void tick() {}
   // Panel brightness in percent; the matrix style also dims its dot colours.

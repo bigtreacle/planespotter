@@ -40,6 +40,16 @@ To change WiFi or location later, hold the BOOT button on the back for
 and longitude. The same page has a "Flip screen" field for a case that
 mounts the board upside down.
 
+## Touch
+
+Tap the screen to step through the four nearest aircraft; a row of small
+dots in the top-left corner shows how many there are and which one is on
+screen. The display follows the aircraft you picked as the others move
+around it, and drifts back to the nearest 30 seconds after the last tap.
+Routes are cached, so stepping back to an aircraft you have already seen is
+instant. Anywhere on the screen counts, so a flipped display needs nothing
+special.
+
 ## Display style
 
 The setup portal has a "Display style" field: `0` is the default crisp
@@ -53,13 +63,15 @@ screen is black and redraws when the style changes.
 On a bench unit the style can also be switched over serial without the
 portal: type `style 1` (or `0`, `2`) in the serial monitor; `flip 1` or
 `flip 0` turns the screen. `dump` prints
-the matrix grid as text, which is handy when tweaking the layout.
+the matrix grid as text, which is handy when tweaking the layout. `tap` does
+what a touch does.
 
 ## If it stops
 
 Every network step is bounded: connections, TLS handshakes and reads each
-give up after 12-15 seconds, so a bad connection shows a red dot rather than
-a frozen display. Behind that, a watchdog watches the main loop. If the
+give up after 12-15 seconds, and a chunked response body is read with its
+own 20-second deadline (the core's HTTP client has none once a chunk has
+started), so a bad connection shows a red dot rather than a frozen display. Behind that, a watchdog watches the main loop. If the
 firmware stops making progress for two minutes anyway, the board reboots on
 its own and carries on. Waiting in the setup portal does not count.
 
@@ -125,6 +137,9 @@ normally; it just stops updating until reflashed over USB.
 - Drawing lives behind the `Renderer` interface in `src/renderer.h`:
   `src/crisp_renderer.cpp` is the original layout, `src/matrix_renderer.cpp`
   the dot-matrix look.
+- Touch is read directly from the XPT2046 in `src/touch.cpp`; the panel is
+  on its own SPI bus (VSPI), not the display's, so TFT_eSPI's touch code is
+  not used.
 - Watchdog, reset-reason record and the persistent log live in `src/diag.cpp`;
   everything logs through the `LOG()` macro from `src/diag.h`.
 - OTA code lives in `src/ota.cpp`; the release pipeline in

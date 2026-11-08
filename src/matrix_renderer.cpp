@@ -190,6 +190,16 @@ class MatrixRenderer : public Renderer {
     flush(false, nullptr);
   }
 
+  void drawSelection(int index, int count) override {
+    // Dots along the top-left edge, two apart; the text rows start lower.
+    for (int i = 0; i < 4; i++) {
+      uint16_t c = TFT_BLACK;
+      if (count >= 2 && i < count) c = i == index ? WARM : DIMWARM;
+      spr.drawPixel(1 + i * 2, 0, c);
+    }
+    flush(false, nullptr);
+  }
+
   void dump() override {
     for (int y = 0; y < rows; y++) {
       char line[96];

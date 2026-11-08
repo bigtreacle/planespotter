@@ -115,6 +115,14 @@ class CrispRenderer : public Renderer {
     tft.fillCircle(W - 7, 7, 3, fetchOk ? TFT_BLACK : TFT_RED);
   }
 
+  void drawSelection(int index, int count) override {
+    // Stays above the headline's ascenders (font 4 centred at y 22).
+    tft.fillRect(0, 0, 40, 8, TFT_BLACK);
+    if (count < 2) return;
+    for (int i = 0; i < count && i < 4; i++)
+      tft.fillCircle(6 + i * 8, 4, i == index ? 3 : 2, i == index ? TFT_WHITE : DIM);
+  }
+
  private:
   TFT_eSPI &tft;
   int lastPct = -1;
