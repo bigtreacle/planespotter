@@ -64,7 +64,8 @@ On a bench unit the style can also be switched over serial without the
 portal: type `style 1` (or `0`, `2`) in the serial monitor; `flip 1` or
 `flip 0` turns the screen. `dump` prints
 the matrix grid as text, which is handy when tweaking the layout. `tap` does
-what a touch does.
+what a touch does; `fallback` swaps the two data sources so the second one
+can be exercised.
 
 ## If it stops
 

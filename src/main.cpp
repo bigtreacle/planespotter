@@ -118,6 +118,7 @@ int nearbyCount = 0;
 int sel = 0;              // index into nearby[] that is on screen
 uint32_t lastTapAt = 0;
 Route routes[ROUTE_CACHE]; // most recently used first
+bool preferFallback = false; // bench: try the second data source first
 uint32_t lastPoll = 0;
 bool lastFetchOk = true;
 bool everFetchedOk = false;
@@ -203,28 +204,61 @@ static void saveConfig() {
 }
 
 // ---------- HTTP ----------
-// Reads a chunked response body into out, giving up after deadlineMs overall.
-// HTTPClient::getString() has no deadline once a chunk has started: a server
-// that stalls mid-chunk but keeps the connection open spins it forever (seen
-// on adsb.fi, 2026-11-08, found by the watchdog's backtrace).
-static bool readChunked(Stream &in, String &out, uint32_t deadlineMs) {
+// Body reading. The core's secure client leaves its socket non-blocking and
+// reports "no data yet" as an error, which NetworkClient::readBytes treats as
+// the end; HTTPClient works around that by looping with no deadline, which is
+// how a server stalling mid-chunk froze the display (adsb.fi, 2026-11-08,
+// found by the watchdog's backtrace). These helpers poll instead, with an
+// inactivity timeout and an overall deadline.
+static const uint32_t BODY_IDLE_MS = 12000;
+
+// One byte, or -1 after BODY_IDLE_MS with nothing (or when the deadline passes).
+static int readByteWithin(Stream &in, uint32_t deadline) {
+  uint32_t idleUntil = millis() + BODY_IDLE_MS;
+  while ((int32_t)(millis() - deadline) < 0 && (int32_t)(millis() - idleUntil) < 0) {
+    if (in.available() > 0) {
+      int c = in.read();
+      if (c >= 0) return c;
+    }
+    delay(2);
+  }
+  return -1;
+}
+
+static bool readLineWithin(Stream &in, String &line, uint32_t deadline) {
+  line = "";
+  for (;;) {
+    int c = readByteWithin(in, deadline);
+    if (c < 0) return false;
+    if (c == '\n') return true;
+    if (c != '\r' && line.length() < 64) line += (char)c;
+  }
+}
+
+// Reads a chunked body into out; false on timeout or a malformed chunk.
+static bool readChunked(NetworkClient &in, String &out, uint32_t deadlineMs) {
   uint32_t deadline = millis() + deadlineMs;
-  char buf[512];
-  while ((int32_t)(millis() - deadline) < 0) {
-    String sizeLine = in.readStringUntil('\n'); // empty only on timeout
-    sizeLine.trim();
-    if (!sizeLine.length()) return false;
-    size_t size = strtoul(sizeLine.c_str(), nullptr, 16);
-    if (size == 0) return true; // final chunk; trailers, if any, are ignored
-    size_t got = 0;
-    while (got < size && (int32_t)(millis() - deadline) < 0) {
-      size_t n = in.readBytes(buf, min(sizeof buf, size - got));
-      if (n == 0) return false; // a full read timeout with nothing: give up
+  String line;
+  while (readLineWithin(in, line, deadline)) {
+    if (!line.length()) continue; // blank line between chunks
+    size_t size = strtoul(line.c_str(), nullptr, 16);
+    if (size == 0) return true;   // final chunk; trailers, if any, are ignored
+    if (!out.reserve(out.length() + size)) return false;
+    for (size_t got = 0; got < size;) {
+      // read() with a length is fine once available() says data is there
+      uint32_t idleUntil = millis() + BODY_IDLE_MS;
+      int avail = 0;
+      while ((avail = in.available()) <= 0) {
+        if ((int32_t)(millis() - deadline) >= 0 || (int32_t)(millis() - idleUntil) >= 0) return false;
+        delay(2);
+      }
+      char buf[512];
+      size_t want = min((size_t)avail, min(sizeof buf, size - got));
+      int n = in.read((uint8_t *)buf, want); // NetworkClient::read, not Stream
+      if (n <= 0) return false;
       out.concat(buf, n);
       got += n;
     }
-    if (got < size) return false;
-    in.readStringUntil('\n'); // CRLF that ends the chunk
   }
   return false;
 }
@@ -300,10 +334,11 @@ static bool fetchNearest() {
   // Both are readsb-style feeds with the same per-aircraft fields; adsb.lol
   // puts the list under "ac", adsb.fi under "aircraft".
   const String lat = String(cfg.lat, 4), lon = String(cfg.lon, 4), rad = String(cfg.radiusNm);
-  const String URLS[] = {
+  String URLS[] = {
       "https://api.adsb.lol/v2/point/" + lat + "/" + lon + "/" + rad,
       "https://opendata.adsb.fi/api/v2/lat/" + lat + "/lon/" + lon + "/dist/" + rad,
   };
+  if (preferFallback) std::swap(URLS[0], URLS[1]); // bench: serial "fallback"
   JsonDocument filter;
   for (const char *list : {"ac", "aircraft"}) {
     JsonObject f = filter[list][0].to<JsonObject>();
@@ -634,6 +669,10 @@ static void handleSerial() {
       renderer->dump();
     } else if (line == "diag") {
       diag::report();
+    } else if (line == "fallback") {
+      preferFallback = !preferFallback;
+      LOG("fallback source first: %d", preferFallback);
+      lastPoll = millis() - POLL_MS;
     } else if (line == "tap") {
       onTap(); // what a touch does, for a bench unit without a finger on it
     } else if (line == "hang") {
