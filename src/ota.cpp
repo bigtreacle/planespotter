@@ -11,6 +11,7 @@
 #include "certs.h"
 
 static const char *REPO_URL = "https://github.com/bigtreacle/planespotter/";
+static const uint32_t TLS_HANDSHAKE_S = 15; // seconds; the core default is 120
 static const char *MANIFEST_URL =
     "https://github.com/bigtreacle/planespotter/releases/latest/download/manifest.json";
 
@@ -96,6 +97,7 @@ void markValid() {
 static bool fetchManifest(JsonDocument &doc, Result &failure) {
   NetworkClientSecure client;
   client.setCACert(GITHUB_ROOT_CAS);
+  client.setHandshakeTimeout(TLS_HANDSHAKE_S);
   HTTPClient http;
   http.setReuse(false);
   http.setTimeout(12000);
@@ -161,6 +163,7 @@ Result check(bool manual, const Ui &ui, String &newVersion) {
 
   NetworkClientSecure client;
   client.setCACert(GITHUB_ROOT_CAS);
+  client.setHandshakeTimeout(TLS_HANDSHAKE_S);
   HTTPUpdate updater(30000);
   updater.rebootOnUpdate(false);  // the caller shows a "done" screen, then restarts
   updater.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);

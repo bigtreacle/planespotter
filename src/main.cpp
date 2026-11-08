@@ -38,6 +38,10 @@ static const uint32_t OTA_VALID_AFTER_MS = 60000;           // uptime that count
 // Longest legitimate blocking stretch in loop() is a few chained 12 s HTTP
 // timeouts; the firmware download feeds the watchdog as it goes.
 static const uint32_t WATCHDOG_S = 120;
+// The core lets a TLS handshake run for two minutes before giving up; on a
+// bad connection that is a frozen display. Cap it so every network step is
+// bounded well inside the watchdog.
+static const uint32_t TLS_HANDSHAKE_S = 15;
 
 // ---------- airline brand colours (by ICAO callsign prefix) ----------
 static const Airline AIRLINES[] = {
@@ -194,6 +198,7 @@ static void saveConfig() {
 static bool getJson(const String &url, JsonDocument &doc, const JsonDocument *filter = nullptr) {
   WiFiClientSecure client;
   client.setInsecure(); // public read-only data; skip certificate pinning
+  client.setHandshakeTimeout(TLS_HANDSHAKE_S);
   HTTPClient http;
   http.setReuse(false); // one request per connection; servers reject HTTP/1.0
   http.setTimeout(12000);

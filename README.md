@@ -57,8 +57,10 @@ the matrix grid as text, which is handy when tweaking the layout.
 
 ## If it stops
 
-A watchdog watches the main loop. If the firmware stops making progress for
-two minutes (a network call that never returns, say) the board reboots on
+Every network step is bounded: connections, TLS handshakes and reads each
+give up after 12-15 seconds, so a bad connection shows a red dot rather than
+a frozen display. Behind that, a watchdog watches the main loop. If the
+firmware stops making progress for two minutes anyway, the board reboots on
 its own and carries on. Waiting in the setup portal does not count.
 
 Every log line is also kept in a small buffer in RTC memory, which survives

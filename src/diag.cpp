@@ -106,7 +106,10 @@ static String coreDumpSummary() {
 void begin() {
   esp_reset_reason_t reason = esp_reset_reason();
   String previous = rtcLogContents();
-  String dump = abnormal(reason) ? coreDumpSummary() : String();
+  // A core dump summary names the task that was running at the moment of the
+  // panic. For a watchdog reset that is whichever task happened to be
+  // scheduled, not the one that stalled, so only report it for real crashes.
+  String dump = reason == ESP_RST_PANIC ? coreDumpSummary() : String();
   rtcLogReset();
 
   prefs.begin("diag", false);
