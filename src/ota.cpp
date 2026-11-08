@@ -1,4 +1,5 @@
 #include "ota.h"
+#include "diag.h"
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
@@ -74,7 +75,7 @@ void begin() {
     // Booted the old firmware with an invalid slot: the new one crashed before
     // it was verified and the bootloader rolled it back. Do not fetch it again,
     // or every unit would loop update -> crash -> rollback until a fix ships.
-    Serial.printf("OTA: %s was rolled back, automatic checks will skip it\n", attempted.c_str());
+    LOG("OTA: %s was rolled back, automatic checks will skip it\n", attempted.c_str());
     prefSet("bad", attempted);
   }
   prefSet("try", "");
@@ -88,7 +89,7 @@ void markValid() {
   esp_ota_img_states_t state;
   if (esp_ota_get_state_partition(running, &state) == ESP_OK && state == ESP_OTA_IMG_PENDING_VERIFY) {
     esp_ota_mark_app_valid_cancel_rollback();
-    Serial.printf("OTA: %s marked valid, rollback cancelled\n", FIRMWARE_VERSION);
+    LOG("OTA: %s marked valid, rollback cancelled\n", FIRMWARE_VERSION);
   }
 }
 
@@ -101,13 +102,13 @@ static bool fetchManifest(JsonDocument &doc, Result &failure) {
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.setUserAgent("planespotter/" FIRMWARE_VERSION " " BOARD_VARIANT);
   if (!http.begin(client, MANIFEST_URL)) {
-    Serial.println("OTA: could not start manifest request");
+    LOG("OTA: could not start manifest request");
     failure = FAILED;
     return false;
   }
   int code = http.GET();
   if (code != 200) {
-    Serial.printf("OTA: manifest HTTP %d\n", code);
+    LOG("OTA: manifest HTTP %d\n", code);
     http.end();
     failure = (code == 404) ? NO_RELEASE : FAILED;
     return false;
@@ -115,7 +116,7 @@ static bool fetchManifest(JsonDocument &doc, Result &failure) {
   DeserializationError err = deserializeJson(doc, http.getString());
   http.end();
   if (err) {
-    Serial.printf("OTA: manifest JSON error: %s\n", err.c_str());
+    LOG("OTA: manifest JSON error: %s\n", err.c_str());
     failure = FAILED;
     return false;
   }
@@ -132,30 +133,30 @@ Result check(bool manual, const Ui &ui, String &newVersion) {
   const char *url = build["url"] | "";
   const char *sha256 = build["sha256"] | "";
   if (!newVersion.length() || !*url || strlen(sha256) != 64) {
-    Serial.println("OTA: manifest has no usable entry for " BOARD_VARIANT);
+    LOG("OTA: manifest has no usable entry for " BOARD_VARIANT);
     return FAILED;
   }
   if (strncmp(url, REPO_URL, strlen(REPO_URL)) != 0) {
-    Serial.printf("OTA: refusing firmware URL outside the release repo: %s\n", url);
+    LOG("OTA: refusing firmware URL outside the release repo: %s\n", url);
     return FAILED;
   }
 
   if (!manual && newVersion == prefGet("bad")) {
-    Serial.printf("OTA: %s previously rolled back, skipping (manual check overrides)\n",
+    LOG("OTA: %s previously rolled back, skipping (manual check overrides)\n",
                   newVersion.c_str());
     return UP_TO_DATE;
   }
   if (isDevBuild()) {
     if (!manual) {
-      Serial.printf("OTA: release %s available, dev build, automatic update skipped\n", newVersion.c_str());
+      LOG("OTA: release %s available, dev build, automatic update skipped\n", newVersion.c_str());
       return UP_TO_DATE;
     }
   } else if (compareVersions(newVersion, FIRMWARE_VERSION) <= 0) {
-    Serial.printf("OTA: up to date (%s, latest release %s)\n", FIRMWARE_VERSION, newVersion.c_str());
+    LOG("OTA: up to date (%s, latest release %s)\n", FIRMWARE_VERSION, newVersion.c_str());
     return UP_TO_DATE;
   }
 
-  Serial.printf("OTA: updating %s -> %s from %s\n", FIRMWARE_VERSION, newVersion.c_str(), url);
+  LOG("OTA: updating %s -> %s from %s\n", FIRMWARE_VERSION, newVersion.c_str(), url);
   if (ui.message) ui.message("Updating", "to version " + newVersion);
 
   NetworkClientSecure client;
@@ -171,13 +172,13 @@ Result check(bool manual, const Ui &ui, String &newVersion) {
   if (r != HTTP_UPDATE_OK) prefSet("try", ""); // nothing was installed
   switch (r) {
     case HTTP_UPDATE_OK:
-      Serial.printf("OTA: %s written and verified\n", newVersion.c_str());
+      LOG("OTA: %s written and verified\n", newVersion.c_str());
       return UPDATED;
     case HTTP_UPDATE_NO_UPDATES:
-      Serial.println("OTA: server reported no update");
+      LOG("OTA: server reported no update");
       return UP_TO_DATE;
     default:
-      Serial.printf("OTA: update failed (%d): %s\n", updater.getLastError(),
+      LOG("OTA: update failed (%d): %s\n", updater.getLastError(),
                     updater.getLastErrorString().c_str());
       return FAILED;
   }

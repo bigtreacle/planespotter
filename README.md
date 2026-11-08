@@ -55,6 +55,20 @@ portal: type `style 1` (or `0`, `2`) in the serial monitor; `flip 1` or
 `flip 0` turns the screen. `dump` prints
 the matrix grid as text, which is handy when tweaking the layout.
 
+## If it stops
+
+A watchdog watches the main loop. If the firmware stops making progress for
+two minutes (a network call that never returns, say) the board reboots on
+its own and carries on. Waiting in the setup portal does not count.
+
+Every log line is also kept in a small buffer in RTC memory, which survives
+a reboot. When a boot follows a crash, a watchdog reset or a brownout, the
+firmware prints what the previous boot was doing just before it stopped,
+and saves that record to flash so it is still there after the unit has been
+unplugged. On a bench unit type `diag` in the serial monitor to see the boot
+counters, free heap and the saved record; `hang` and `crash` provoke a
+watchdog reset and a panic on purpose to prove the machinery works.
+
 ## Updates
 
 Units check for a new firmware release 20 seconds after connecting to WiFi
@@ -109,6 +123,8 @@ normally; it just stops updating until reflashed over USB.
 - Drawing lives behind the `Renderer` interface in `src/renderer.h`:
   `src/crisp_renderer.cpp` is the original layout, `src/matrix_renderer.cpp`
   the dot-matrix look.
+- Watchdog, reset-reason record and the persistent log live in `src/diag.cpp`;
+  everything logs through the `LOG()` macro from `src/diag.h`.
 - OTA code lives in `src/ota.cpp`; the release pipeline in
   `.github/workflows/release.yml` and `scripts/make_manifest.py`.
 - Data: adsb.lol (fallback adsb.fi), adsbdb.com, postcodes.io.

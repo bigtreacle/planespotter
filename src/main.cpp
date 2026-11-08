@@ -21,6 +21,7 @@
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
 
+#include "diag.h"
 #include "ota.h"
 #include "model.h"
 #include "renderer.h"
@@ -34,6 +35,9 @@ static const uint32_t OTA_BOOT_DELAY_MS = 20000;            // after WiFi is up
 static const uint32_t OTA_PERIOD_MS = 24UL * 60 * 60 * 1000; // then daily
 static const uint32_t OTA_RETRY_MS = 10UL * 60 * 1000;      // after a check that could not complete
 static const uint32_t OTA_VALID_AFTER_MS = 60000;           // uptime that counts as "works"
+// Longest legitimate blocking stretch in loop() is a few chained 12 s HTTP
+// timeouts; the firmware download feeds the watchdog as it goes.
+static const uint32_t WATCHDOG_S = 120;
 
 // ---------- airline brand colours (by ICAO callsign prefix) ----------
 static const Airline AIRLINES[] = {
@@ -198,7 +202,7 @@ static bool getJson(const String &url, JsonDocument &doc, const JsonDocument *fi
   if (!http.begin(client, url)) return false;
   int code = http.GET();
   if (code != 200) {
-    Serial.printf("HTTP %d for %s\n", code, url.c_str());
+    LOG("HTTP %d for %s\n", code, url.c_str());
     http.end();
     return false;
   }
@@ -214,7 +218,7 @@ static bool getJson(const String &url, JsonDocument &doc, const JsonDocument *fi
                  : deserializeJson(doc, body);
   }
   http.end();
-  if (err) Serial.printf("JSON error: %s\n", err.c_str());
+  if (err) LOG("JSON error: %s\n", err.c_str());
   return !err;
 }
 
@@ -281,8 +285,8 @@ static bool fetchNearest(Plane &out) {
     out.distMi = d;
     out.bearing = bearingDeg(cfg.lat, cfg.lon, a["lat"], a["lon"]);
   }
-  Serial.printf("%s: %d aircraft, nearest %s at %.1f mi\n", used->c_str(), (int)list.size(),
-                out.valid ? out.callsign.c_str() : "-", out.distMi);
+  LOG("%s: %d aircraft, nearest %s at %.1f mi, heap %lu", used->c_str(), (int)list.size(),
+      out.valid ? out.callsign.c_str() : "-", out.distMi, (unsigned long)ESP.getFreeHeap());
   return true;
 }
 
@@ -317,7 +321,7 @@ static void drawStatusDot() { renderer->drawStatusDot(lastFetchOk); }
 static void drawPlane(const Plane &p) {
   uint32_t t0 = millis();
   renderer->drawPlane(p, route, findAirline(p.callsign));
-  Serial.printf("style %d: full redraw of %s took %lu ms\n", cfg.style, p.callsign.c_str(),
+  LOG("style %d: full redraw of %s took %lu ms\n", cfg.style, p.callsign.c_str(),
                 (unsigned long)(millis() - t0));
 }
 
@@ -381,7 +385,9 @@ static void applyPortalParams() {
 
 static void runPortal(bool onDemand) {
   wm.setConfigPortalTimeout(onDemand ? 300 : 0);
+  diag::watchdogPause(); // waiting for a person is not a hang
   bool ok = onDemand ? wm.startConfigPortal(AP_NAME) : wm.autoConnect(AP_NAME);
+  diag::watchdogResume();
   applyPortalParams();
   if (onDemand || !ok) ESP.restart();
 }
@@ -398,7 +404,10 @@ static ota::Result runOtaCheck(bool manual) {
     otaScreenShown = true;
     drawMessage(title, line.c_str());
   };
-  ui.progress = drawProgress;
+  ui.progress = [](int done, int total) {
+    diag::feed(); // a slow download is progress, not a hang
+    drawProgress(done, total);
+  };
 
   String newVersion;
   ota::Result r = ota::check(manual, ui, newVersion);
@@ -435,6 +444,9 @@ static ota::Result runOtaCheck(bool manual) {
 // ---------- main ----------
 void setup() {
   Serial.begin(115200);
+  diag::begin(); // reports why the last boot ended before anything else logs
+  LOG("PlaneSpotter %s (%s)", ota::versionLabel().c_str(), BOARD_VARIANT);
+  diag::watchdogStart(WATCHDOG_S);
   pinMode(BOOT_BTN, INPUT_PULLUP);
 
   tft.init();
@@ -488,7 +500,9 @@ void setup() {
 }
 
 // Serial commands for a bench unit: "style N" switches display style without
-// the portal (saved like a portal change); "dump" prints the screen as text.
+// the portal (saved like a portal change); "flip N"; "dump" prints the screen
+// as text; "diag" prints the boot counters and the log from before the last
+// crash or watchdog reset; "hang" and "crash" provoke those two on purpose.
 static void handleSerial() {
   static String line;
   while (Serial.available()) {
@@ -502,21 +516,28 @@ static void handleSerial() {
       setStyle(style);
       saveConfig();
       lastPoll = millis() - POLL_MS; // redraw straight away
-      Serial.printf("style set to %d\n", style);
+      LOG("style set to %d\n", style);
     } else if (line.startsWith("flip ")) {
       cfg.flip = line.substring(5).toInt() != 0;
       saveConfig();
       applyFlip();
       lastPoll = millis() - POLL_MS;
-      Serial.printf("flip set to %d\n", cfg.flip);
+      LOG("flip set to %d\n", cfg.flip);
     } else if (line == "dump") {
       renderer->dump();
+    } else if (line == "diag") {
+      diag::report();
+    } else if (line == "hang") {
+      diag::testHang(); // does not return; the watchdog reboots the board
+    } else if (line == "crash") {
+      diag::testCrash(); // does not return; panic, core dump, reboot
     }
     line = "";
   }
 }
 
 void loop() {
+  diag::feed();
   handleSerial();
 
   // BOOT button: hold 3 seconds to reopen the setup portal, short press to
